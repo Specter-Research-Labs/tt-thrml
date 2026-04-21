@@ -31,10 +31,13 @@ from .runtime import (
     supports_direct_ttnn_inputs,
 )
 from .tensor_bridge import (
+    abstract_jax_input,
     execute_single_output_flatbuffer,
     numpy_to_torch,
-    optional_ttnn_input_as_torch,
+    normalized_dtype_name,
     torch_to_jax,
+    tensor_shape,
+    optional_ttnn_input_as_torch,
     ttnn_input_as_torch,
 )
 from ..ttnn_kernels import categorical_theta_dense_expected
@@ -108,10 +111,6 @@ class TTMLIRCategoricalThetaOp:
     def _compile_artifact(
         self,
         signature: TTMLIRCategoricalThetaOpSignature,
-        *,
-        flat_weights: torch.Tensor,
-        flat_index: torch.Tensor | None,
-        interaction_scale: torch.Tensor,
     ) -> TTMLIRCategoricalThetaOpArtifact:
         compiled = get_or_compile_cached_artifact(
             self.config,
@@ -119,12 +118,7 @@ class TTMLIRCategoricalThetaOp:
             signature=signature,
             base_name_prefix=self.base_name_prefix,
             stablehlo_module_text_factory=lambda: lower_categorical_theta_inputs_to_stablehlo(
-                flat_weights=flat_weights,
-                flat_index=flat_index,
-                interaction_scale=interaction_scale,
-                n_nodes=signature.n_nodes,
-                n_interactions=signature.n_interactions,
-                n_categories=signature.n_categories,
+                signature=signature,
             ),
             compile_fn=compile_stablehlo_to_flatbuffer,
         )
@@ -147,36 +141,20 @@ class TTMLIRCategoricalThetaOp:
         device,
         inputs: CategoricalThetaInputs,
     ):
-        flat_weights = ttnn_input_as_torch(ttnn, inputs.flat_weights, dtype=torch.float32)
-        interaction_scale = ttnn_input_as_torch(
-            ttnn,
-            inputs.interaction_scale,
-            dtype=torch.float32,
-        )
-        flat_index = optional_ttnn_input_as_torch(
-            ttnn,
-            inputs.flat_index,
-            dtype=torch.uint32,
-        )
-
         signature = categorical_theta_op_signature(
-            flat_weights=flat_weights,
-            flat_index=flat_index,
-            interaction_scale=interaction_scale,
+            flat_weights_shape=tensor_shape(inputs.flat_weights),
+            flat_weights_dtype=torch.float32,
+            flat_index_shape=None
+            if inputs.flat_index is None
+            else tensor_shape(inputs.flat_index),
+            flat_index_dtype=None if inputs.flat_index is None else torch.uint32,
+            interaction_scale_shape=tensor_shape(inputs.interaction_scale),
+            interaction_scale_dtype=torch.float32,
             n_nodes=inputs.n_nodes,
             n_interactions=inputs.n_interactions,
             n_categories=inputs.n_categories,
         )
-        artifact = self._compile_artifact(
-            signature,
-            flat_weights=flat_weights,
-            flat_index=flat_index,
-            interaction_scale=interaction_scale,
-        )
-        runtime_inputs = [flat_weights]
-        if flat_index is not None:
-            runtime_inputs.append(flat_index)
-        runtime_inputs.append(interaction_scale)
+        artifact = self._compile_artifact(signature)
         direct_runtime_inputs = [inputs.flat_weights]
         if inputs.flat_index is not None:
             direct_runtime_inputs.append(inputs.flat_index)
@@ -186,7 +164,7 @@ class TTMLIRCategoricalThetaOp:
             ttnn=ttnn,
             device=device,
             flatbuffer_path=artifact.flatbuffer_path,
-            input_tensors=runtime_inputs,
+            input_tensors_factory=lambda: _runtime_host_inputs(ttnn, inputs),
             direct_input_tensors=direct_runtime_inputs,
             output_reference=inputs.flat_weights,
             op_name="categorical-theta op",
@@ -274,22 +252,48 @@ def _to_jax_uint32(value: torch.Tensor) -> jax.Array:
 
 def categorical_theta_op_signature(
     *,
-    flat_weights: torch.Tensor,
-    flat_index: torch.Tensor | None,
-    interaction_scale: torch.Tensor,
+    flat_weights: torch.Tensor | None = None,
+    flat_index: torch.Tensor | None = None,
+    interaction_scale: torch.Tensor | None = None,
+    flat_weights_shape: tuple[int, ...] | None = None,
+    flat_weights_dtype=None,
+    flat_index_shape: tuple[int, ...] | None = None,
+    flat_index_dtype=None,
+    interaction_scale_shape: tuple[int, ...] | None = None,
+    interaction_scale_dtype=None,
     n_nodes: int,
     n_interactions: int,
     n_categories: int,
 ) -> TTMLIRCategoricalThetaOpSignature:
+    if flat_weights_shape is None:
+        if flat_weights is None:
+            raise TypeError(
+                "categorical_theta_op_signature requires flat_weights or flat_weights_shape."
+            )
+        flat_weights_shape = tensor_shape(flat_weights)
+    if flat_weights_dtype is None:
+        flat_weights_dtype = torch.float32 if flat_weights is None else flat_weights.dtype
+    if flat_index is not None and flat_index_shape is None:
+        flat_index_shape = tensor_shape(flat_index)
+    if flat_index_dtype is None and flat_index is not None:
+        flat_index_dtype = flat_index.dtype
+    if interaction_scale_shape is None:
+        if interaction_scale is None:
+            raise TypeError(
+                "categorical_theta_op_signature requires interaction_scale or interaction_scale_shape."
+            )
+        interaction_scale_shape = tensor_shape(interaction_scale)
+    if interaction_scale_dtype is None:
+        interaction_scale_dtype = (
+            torch.float32 if interaction_scale is None else interaction_scale.dtype
+        )
     return TTMLIRCategoricalThetaOpSignature(
-        flat_weights_shape=tuple(int(size) for size in flat_weights.shape),
-        flat_weights_dtype=str(flat_weights.dtype),
-        flat_index_shape=None
-        if flat_index is None
-        else tuple(int(size) for size in flat_index.shape),
-        flat_index_dtype=None if flat_index is None else str(flat_index.dtype),
-        interaction_scale_shape=tuple(int(size) for size in interaction_scale.shape),
-        interaction_scale_dtype=str(interaction_scale.dtype),
+        flat_weights_shape=tuple(int(size) for size in flat_weights_shape),
+        flat_weights_dtype=normalized_dtype_name(flat_weights_dtype),
+        flat_index_shape=None if flat_index_shape is None else tuple(int(size) for size in flat_index_shape),
+        flat_index_dtype=None if flat_index_dtype is None else normalized_dtype_name(flat_index_dtype),
+        interaction_scale_shape=tuple(int(size) for size in interaction_scale_shape),
+        interaction_scale_dtype=normalized_dtype_name(interaction_scale_dtype),
         n_nodes=int(n_nodes),
         n_interactions=int(n_interactions),
         n_categories=int(n_categories),
@@ -448,26 +452,63 @@ def lower_packed_categorical_theta_to_stablehlo(
 
 def lower_categorical_theta_inputs_to_stablehlo(
     *,
-    flat_weights: torch.Tensor,
-    flat_index: torch.Tensor | None,
-    interaction_scale: torch.Tensor,
-    n_nodes: int,
-    n_interactions: int,
-    n_categories: int,
+    signature: TTMLIRCategoricalThetaOpSignature | None = None,
+    flat_weights: torch.Tensor | None = None,
+    flat_index: torch.Tensor | None = None,
+    interaction_scale: torch.Tensor | None = None,
+    n_nodes: int | None = None,
+    n_interactions: int | None = None,
+    n_categories: int | None = None,
 ) -> str:
-    kernel = _make_categorical_theta_inputs_kernel(
-        flat_weights_shape=tuple(flat_weights.shape),
-        has_flat_index=flat_index is not None,
+    signature = signature or categorical_theta_op_signature(
+        flat_weights=flat_weights,
+        flat_index=flat_index,
+        interaction_scale=interaction_scale,
         n_nodes=n_nodes,
         n_interactions=n_interactions,
         n_categories=n_categories,
     )
-    lowered_inputs = [_to_jax_float(flat_weights)]
-    if flat_index is not None:
-        lowered_inputs.append(_to_jax_uint32(flat_index))
-    lowered_inputs.append(_to_jax_float(interaction_scale))
+    kernel = _make_categorical_theta_inputs_kernel(
+        flat_weights_shape=signature.flat_weights_shape,
+        has_flat_index=signature.flat_index_shape is not None,
+        n_nodes=signature.n_nodes,
+        n_interactions=signature.n_interactions,
+        n_categories=signature.n_categories,
+    )
+    lowered_inputs = [
+        abstract_jax_input(signature.flat_weights_shape, dtype=signature.flat_weights_dtype)
+    ]
+    if signature.flat_index_shape is not None:
+        lowered_inputs.append(
+            abstract_jax_input(signature.flat_index_shape, dtype=signature.flat_index_dtype)
+        )
+    lowered_inputs.append(
+        abstract_jax_input(
+            signature.interaction_scale_shape,
+            dtype=signature.interaction_scale_dtype,
+        )
+    )
     lowered = jax.jit(kernel).lower(*lowered_inputs)
     return stablehlo_text(lowered)
+
+
+def _runtime_host_inputs(ttnn, inputs: CategoricalThetaInputs) -> list[torch.Tensor]:
+    flat_weights = ttnn_input_as_torch(ttnn, inputs.flat_weights, dtype=torch.float32)
+    interaction_scale = ttnn_input_as_torch(
+        ttnn,
+        inputs.interaction_scale,
+        dtype=torch.float32,
+    )
+    flat_index = optional_ttnn_input_as_torch(
+        ttnn,
+        inputs.flat_index,
+        dtype=torch.uint32,
+    )
+    runtime_inputs = [flat_weights]
+    if flat_index is not None:
+        runtime_inputs.append(flat_index)
+    runtime_inputs.append(interaction_scale)
+    return runtime_inputs
 
 
 def make_ttmlir_categorical_theta_op(

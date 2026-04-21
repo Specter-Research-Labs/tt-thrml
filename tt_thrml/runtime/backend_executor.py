@@ -11,6 +11,7 @@ from thrml.block_sampling import BlockSamplingProgram, SamplingSchedule
 from thrml.observers import AbstractObserver, MomentAccumulatorObserver
 
 from ..compiler.sampler_lowering import program_supported_by_executor
+from ..fingerprint import program_fingerprint
 from .execution_support import LoadedObservationJob, LoadedStateJob
 from .mesh_executor import TTMeshProgramExecutor, is_multi_device_mesh
 from .program_executor import TTProgramExecutor
@@ -45,6 +46,8 @@ _COORDINATOR_CACHE: dict[
     "_MultiDeviceTTCoordinator",
 ] = {}
 _PROGRAM_CACHE_FINALIZERS: dict[int, weakref.finalize] = {}
+_PROGRAM_INSTANCE_TOKENS: dict[int, object] = {}
+_CACHE_LOCK = threading.RLock()
 
 
 @dataclass
@@ -62,6 +65,23 @@ def _validate_program(program: BlockSamplingProgram) -> None:
         )
 
 
+def _program_instance_token(program: BlockSamplingProgram) -> object:
+    program_id = id(program)
+    token = _PROGRAM_INSTANCE_TOKENS.get(program_id)
+    if token is not None:
+        return token
+
+    token = object()
+    _PROGRAM_INSTANCE_TOKENS[program_id] = token
+    if program_id not in _PROGRAM_CACHE_FINALIZERS:
+        _PROGRAM_CACHE_FINALIZERS[program_id] = weakref.finalize(
+            program,
+            _clear_compiled_program_cache_for_program_id,
+            program_id,
+        )
+    return token
+
+
 def _make_executor(
     *,
     program: BlockSamplingProgram,
@@ -73,15 +93,23 @@ def _make_executor(
     parameter_kernel_ops = backend.parameter_kernel_ops
     parameter_kernel_backends = backend.parameter_kernel_backends
     ttnn = backend.ttnn
-    cache_key = (id(program), *backend.device_cache_key(device))
-    executor_cache_key = (id(program), *backend.executor_cache_key(device))
+    semantic_program_key = program_fingerprint(program)
+    program_token = _program_instance_token(program)
+    cache_key = (semantic_program_key, *backend.device_cache_key(device))
+    executor_cache_key = (
+        program_token,
+        semantic_program_key,
+        *backend.executor_cache_key(device),
+    )
     cache_executor = options.cacheable
     if cache_executor:
-        cached_entry = _EXECUTOR_CACHE.get(executor_cache_key)
+        with _CACHE_LOCK:
+            cached_entry = _EXECUTOR_CACHE.get(executor_cache_key)
         if cached_entry is not None:
             return cached_entry.executor
 
-    compiled = _COMPILED_PROGRAM_CACHE.get(cache_key)
+    with _CACHE_LOCK:
+        compiled = _COMPILED_PROGRAM_CACHE.get(cache_key)
 
     executor_cls = TTMeshProgramExecutor if is_multi_device_mesh(device) else TTProgramExecutor
 
@@ -108,21 +136,15 @@ def _make_executor(
             profile_sync=options.profile_sync,
             progress=options.progress,
         )
-        _COMPILED_PROGRAM_CACHE[cache_key] = executor.compiled
+        with _CACHE_LOCK:
+            _COMPILED_PROGRAM_CACHE[cache_key] = executor.compiled
 
     if cache_executor:
-        _EXECUTOR_CACHE[executor_cache_key] = _ExecutorCacheEntry(
-            executor=executor,
-            lock=threading.RLock(),
-        )
-
-    program_id = id(program)
-    if program_id not in _PROGRAM_CACHE_FINALIZERS:
-        _PROGRAM_CACHE_FINALIZERS[program_id] = weakref.finalize(
-            program,
-            _clear_compiled_program_cache_for_program_id,
-            program_id,
-        )
+        with _CACHE_LOCK:
+            _EXECUTOR_CACHE[executor_cache_key] = _ExecutorCacheEntry(
+                executor=executor,
+                lock=threading.RLock(),
+            )
 
     return executor
 
@@ -148,38 +170,44 @@ def borrow_executor(
         yield executor
         return
 
+    semantic_program_key = program_fingerprint(program)
     executor_cache_key = (
-        id(program),
+        _program_instance_token(program),
+        semantic_program_key,
         *backend.executor_cache_key(device_for_executor),
     )
-    with _EXECUTOR_CACHE[executor_cache_key].lock:
+    with _CACHE_LOCK:
+        entry = _EXECUTOR_CACHE[executor_cache_key]
+    with entry.lock:
         yield executor
 
 
 def _clear_compiled_program_cache_for_program_id(program_id: int) -> None:
-    stale_keys = [key for key in _COMPILED_PROGRAM_CACHE if key[0] == program_id]
-    for key in stale_keys:
-        _COMPILED_PROGRAM_CACHE.pop(key, None)
-    stale_executor_keys = [key for key in _EXECUTOR_CACHE if key[0] == program_id]
-    for key in stale_executor_keys:
-        _EXECUTOR_CACHE.pop(key, None)
-    stale_coordinator_keys = [key for key in _COORDINATOR_CACHE if key[0] == program_id]
-    for key in stale_coordinator_keys:
-        coordinator = _COORDINATOR_CACHE.pop(key, None)
-        if coordinator is not None:
-            coordinator.shutdown()
+    program_token = _PROGRAM_INSTANCE_TOKENS.pop(program_id, None)
+    if program_token is not None:
+        stale_executor_keys = [key for key in _EXECUTOR_CACHE if key[0] is program_token]
+        for key in stale_executor_keys:
+            _EXECUTOR_CACHE.pop(key, None)
+        stale_coordinator_keys = [key for key in _COORDINATOR_CACHE if key[0] is program_token]
+        for key in stale_coordinator_keys:
+            coordinator = _COORDINATOR_CACHE.pop(key, None)
+            if coordinator is not None:
+                coordinator.shutdown()
     _PROGRAM_CACHE_FINALIZERS.pop(program_id, None)
 
 
 def clear_compiled_program_cache() -> None:
-    _COMPILED_PROGRAM_CACHE.clear()
-    _EXECUTOR_CACHE.clear()
-    for coordinator in _COORDINATOR_CACHE.values():
+    with _CACHE_LOCK:
+        _COMPILED_PROGRAM_CACHE.clear()
+        _EXECUTOR_CACHE.clear()
+        coordinators = tuple(_COORDINATOR_CACHE.values())
+        _COORDINATOR_CACHE.clear()
+        for finalizer in _PROGRAM_CACHE_FINALIZERS.values():
+            finalizer.detach()
+        _PROGRAM_CACHE_FINALIZERS.clear()
+        _PROGRAM_INSTANCE_TOKENS.clear()
+    for coordinator in coordinators:
         coordinator.shutdown()
-    _COORDINATOR_CACHE.clear()
-    for finalizer in _PROGRAM_CACHE_FINALIZERS.values():
-        finalizer.detach()
-    _PROGRAM_CACHE_FINALIZERS.clear()
 
 
 class _MultiDeviceTTCoordinator:
@@ -385,11 +413,10 @@ def make_coordinator(
             options=options,
         )
 
-    cache_key = (
-        id(program),
-        *backend.cache_key,
-    )
-    cached = _COORDINATOR_CACHE.get(cache_key)
+    semantic_program_key = program_fingerprint(program)
+    cache_key = (_program_instance_token(program), semantic_program_key, *backend.cache_key)
+    with _CACHE_LOCK:
+        cached = _COORDINATOR_CACHE.get(cache_key)
     if cached is not None:
         return cached
 
@@ -398,5 +425,6 @@ def make_coordinator(
         backend=backend,
         options=options,
     )
-    _COORDINATOR_CACHE[cache_key] = coordinator
+    with _CACHE_LOCK:
+        _COORDINATOR_CACHE[cache_key] = coordinator
     return coordinator

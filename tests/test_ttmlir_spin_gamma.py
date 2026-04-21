@@ -1,6 +1,11 @@
 from pathlib import Path
 
-import torch
+try:
+    import torch
+except ImportError:
+    from tests.parity._torch_stub import install_torch_stub
+
+    torch = install_torch_stub()
 
 from tt_thrml.compiler.discrete_ebm_packing import PackedSpinGammaBatch
 from tt_thrml.compiler.spin_ops import SpinGammaInputs, dense_spin_gamma_op
@@ -74,6 +79,18 @@ def test_ttmlir_spin_gamma_tail_lowering_avoids_stablehlo_gather():
     packed_text = lower_packed_spin_gamma_to_stablehlo(batch)
 
     assert "stablehlo.gather" not in packed_text
+
+
+def test_ttmlir_spin_gamma_tail_lowering_accepts_four_dim_interaction_scale():
+    text = lower_spin_gamma_inputs_to_stablehlo(
+        flat_weights=torch.ones((1, 1, 8, 5, 5), dtype=torch.float32),
+        flat_index=torch.zeros((1, 1, 8, 5, 1), dtype=torch.uint32),
+        interaction_scale=torch.ones((1, 1, 8, 5), dtype=torch.float32),
+        n_nodes=8,
+        n_interactions=5,
+    )
+
+    assert "stablehlo" in text
 
 
 def test_ttmlir_spin_gamma_op_caches_compilation_and_matches_dense_path(
@@ -163,6 +180,10 @@ def test_ttmlir_spin_gamma_op_caches_compilation_and_matches_dense_path(
         fake_compile,
     )
     monkeypatch.setattr("tt_thrml.compiler.ttmlir.spin_gamma.run_flatbuffer", fake_run)
+    monkeypatch.setattr(
+        "tt_thrml.compiler.ttmlir.spin_gamma.supports_direct_ttnn_inputs",
+        lambda *, device=None: True,
+    )
 
     op_a = make_ttmlir_spin_gamma_op(
         config=TTMLIRConfig(
@@ -185,7 +206,7 @@ def test_ttmlir_spin_gamma_op_caches_compilation_and_matches_dense_path(
     assert torch.allclose(result_b, expected)
     assert len(compile_calls) == 1
     assert len(run_calls) == 2
-    assert fake_ttnn.to_torch_calls == 6
+    assert fake_ttnn.to_torch_calls == 0
 
 
 def test_ttmlir_spin_gamma_op_passes_original_inputs_to_runtime_when_bridge_supports_ttnn_tensors(
@@ -269,7 +290,7 @@ def test_ttmlir_spin_gamma_op_passes_original_inputs_to_runtime_when_bridge_supp
     result = op(ttnn=fake_ttnn, device="fake", inputs=inputs)
 
     assert torch.allclose(result, torch.ones((1, 1, 1, 1), dtype=torch.float32))
-    assert fake_ttnn.to_torch_calls == 3
+    assert fake_ttnn.to_torch_calls == 0
 
 
 def test_ttmlir_spin_gamma_op_signature_distinguishes_tail_and_dense_shapes():

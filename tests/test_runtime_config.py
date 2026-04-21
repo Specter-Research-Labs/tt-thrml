@@ -1,7 +1,13 @@
 import pytest
+from thrml.block_management import Block
+from thrml.block_sampling import BlockGibbsSpec
+from thrml.factor import FactorSamplingProgram
+from thrml.models.discrete_ebm import CategoricalEBMFactor, CategoricalGibbsConditional
+from thrml.pgm import CategoricalNode
 
 import tt_thrml
 import tt_thrml.runtime_config as runtime_config
+from tt_thrml.fingerprint import backend_object_fingerprint, program_fingerprint, stable_fingerprint
 from tt_thrml.runtime_config import (
     BackendBinding,
     CATEGORICAL_PARAMETER_FAMILY,
@@ -94,25 +100,34 @@ def test_backend_binding_cache_key_helpers_reuse_normalized_parameter_cache_key(
         (SPIN_PARAMETER_FAMILY.value, ParameterKernelBackend.CUSTOM.value),
     )
     expected_parameter_kernel_cache_key = (
-        (CATEGORICAL_PARAMETER_FAMILY.value, id(theta_op)),
-        (SPIN_PARAMETER_FAMILY.value, id(spin_op)),
+        (
+            CATEGORICAL_PARAMETER_FAMILY.value,
+            backend_object_fingerprint(theta_op),
+        ),
+        (
+            SPIN_PARAMETER_FAMILY.value,
+            backend_object_fingerprint(spin_op),
+        ),
     )
 
     assert binding.cache_key == reordered.cache_key
     assert binding.cache_key == (
-        id(ttnn),
-        (id(devices[0]), id(devices[1])),
+        backend_object_fingerprint(ttnn),
+        (
+            backend_object_fingerprint(devices[0]),
+            backend_object_fingerprint(devices[1]),
+        ),
         expected_parameter_kernel_backend_key,
         expected_parameter_kernel_cache_key,
     )
     assert binding.device_cache_key(devices[1]) == (
-        id(ttnn),
-        id(devices[1]),
+        backend_object_fingerprint(ttnn),
+        backend_object_fingerprint(devices[1]),
         expected_parameter_kernel_backend_key,
     )
     assert binding.executor_cache_key(devices[0]) == (
-        id(ttnn),
-        id(devices[0]),
+        backend_object_fingerprint(ttnn),
+        backend_object_fingerprint(devices[0]),
         expected_parameter_kernel_backend_key,
         expected_parameter_kernel_cache_key,
     )
@@ -187,6 +202,23 @@ def test_runtime_config_surface_matches_backend_binding_end_state():
     assert not hasattr(runtime_config, "configure_default_backend")
     assert not hasattr(runtime_config, "get_default_backend")
     assert not hasattr(runtime_config, "resolve_backend")
+
+
+def test_fingerprint_accepts_node_types_and_programs_with_node_type_metadata():
+    node = CategoricalNode()
+    program = FactorSamplingProgram(
+        BlockGibbsSpec(
+            [Block([node])],
+            [],
+            {},
+        ),
+        [CategoricalGibbsConditional(3)],
+        [CategoricalEBMFactor([Block([node])], [[0.1, -0.1, 0.2]])],
+        [],
+    )
+
+    assert stable_fingerprint(CategoricalNode) == stable_fingerprint(CategoricalNode)
+    assert isinstance(program_fingerprint(program), str)
 
 
 def test_import_tt_thrml_without_torch_keeps_minimal_root_surface(monkeypatch):

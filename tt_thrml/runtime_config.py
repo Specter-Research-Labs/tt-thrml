@@ -5,6 +5,8 @@ from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import TypeAlias
 
+from .fingerprint import backend_object_fingerprint
+
 BackendDevice: TypeAlias = object
 BackendDevices: TypeAlias = BackendDevice | tuple[BackendDevice, ...] | list[BackendDevice]
 
@@ -304,21 +306,32 @@ class BackendBinding:
         )
 
     @property
-    def parameter_kernel_op_key(self) -> tuple[tuple[str, int], ...]:
-        return tuple((family.value, id(op)) for family, op in self._parameter_kernel_ops)
+    def parameter_kernel_op_key(self) -> tuple[tuple[str, str], ...]:
+        return tuple(
+            (family.value, backend_object_fingerprint(op))
+            for family, op in self._parameter_kernel_ops
+        )
+
+    @property
+    def semantic_ttnn_key(self) -> str:
+        return backend_object_fingerprint(self.ttnn)
+
+    @property
+    def device_key(self) -> tuple[str, ...]:
+        return tuple(backend_object_fingerprint(device) for device in self.devices)
 
     @property
     def cache_key(
         self,
     ) -> tuple[
-        int,
-        tuple[int, ...],
+        str,
+        tuple[str, ...],
         tuple[tuple[str, str], ...],
-        tuple[tuple[str, int], ...],
+        tuple[tuple[str, str], ...],
     ]:
         return (
-            id(self.ttnn),
-            tuple(id(device) for device in self.devices),
+            self.semantic_ttnn_key,
+            self.device_key,
             self.parameter_kernel_backend_key,
             self.parameter_kernel_op_key,
         )
@@ -326,32 +339,36 @@ class BackendBinding:
     def device_cache_key(
         self,
         device: BackendDevice | None = None,
-    ) -> tuple[int, int, tuple[tuple[str, str], ...]]:
+    ) -> tuple[str, str, tuple[tuple[str, str], ...]]:
         resolved_device = self.primary_device if device is None else device
-        ttnn_id, _device_ids, parameter_kernel_backend_key, _parameter_kernel_op_key = (
+        ttnn_key, _device_ids, parameter_kernel_backend_key, _parameter_kernel_op_key = (
             self.cache_key
         )
-        return (ttnn_id, id(resolved_device), parameter_kernel_backend_key)
+        return (
+            ttnn_key,
+            backend_object_fingerprint(resolved_device),
+            parameter_kernel_backend_key,
+        )
 
     def executor_cache_key(
         self,
         device: BackendDevice | None = None,
     ) -> tuple[
-        int,
-        int,
+        str,
+        str,
         tuple[tuple[str, str], ...],
-        tuple[tuple[str, int], ...],
+        tuple[tuple[str, str], ...],
     ]:
         resolved_device = self.primary_device if device is None else device
         (
-            ttnn_id,
+            ttnn_key,
             _device_ids,
             parameter_kernel_backend_key,
             parameter_kernel_op_key,
         ) = self.cache_key
         return (
-            ttnn_id,
-            id(resolved_device),
+            ttnn_key,
+            backend_object_fingerprint(resolved_device),
             parameter_kernel_backend_key,
             parameter_kernel_op_key,
         )

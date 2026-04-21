@@ -5,7 +5,10 @@ from typing import Protocol
 
 import torch
 
+from .device_contract import raise_host_fallback_disabled
 from .ttnn_kernels import select_last_dim_expected
+
+SPIN_PARAMETER_TO_GAMMA_SCALE = 2.0
 
 
 @dataclass(frozen=True)
@@ -31,15 +34,12 @@ def _select_reference_tail(
     if flat_index is None:
         return flat_weights
 
-    selected_host = select_last_dim_expected(
-        ttnn.to_torch(flat_weights),
-        ttnn.to_torch(flat_index).to(torch.int64),
-    )
-    return ttnn.from_torch(
-        selected_host,
-        dtype=getattr(flat_weights, "dtype", None),
-        layout=getattr(flat_weights, "layout", None),
-        device=device,
+    raise_host_fallback_disabled(
+        "native spin tail selection",
+        remedy=(
+            "Use the TT-MLIR parameter-kernel backend for spin blocks with "
+            "indexed categorical tails."
+        ),
     )
 
 
@@ -74,3 +74,11 @@ def dense_spin_gamma_op(
             (batch_size, 1, inputs.n_nodes, inputs.n_interactions),
         )
     return ttnn.sum(weighted_4d, dim=3, keepdim=True)
+
+
+__all__ = [
+    "SPIN_PARAMETER_TO_GAMMA_SCALE",
+    "SpinGammaInputs",
+    "SpinGammaOp",
+    "dense_spin_gamma_op",
+]

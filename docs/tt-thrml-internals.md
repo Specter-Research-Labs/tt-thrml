@@ -1,73 +1,65 @@
-# tt-thrml Internals
+# TT-THRML Internals
 
-This is the whole idea in one sentence:
+`tt-thrml` has one simple boundary:
 
-`thrml` defines the probabilistic program; `tt-thrml` runs its grouped sampling loop on TT hardware.
+- upstream `thrml` owns program authoring
+- `tt-thrml` owns Tenstorrent execution
 
-## Mental Model
+The executor keeps canonical block state on device, compiles TT-shaped metadata once, and routes parameter-family math through TT-MLIR-backed kernels.
 
-- upstream `thrml` owns authoring
-- `tt-thrml` owns execution
-- TT-MLIR owns parameter-kernel math
-- TTNN owns device/runtime state and execution plumbing
-
-So `tt-thrml` is not a second authoring library. It is an execution layer.
-
-## Execution Flow
+## Architecture
 
 ```mermaid
 flowchart TD
-    A["THRML program + schedule"] --> B["tt_thrml.sample_states(...)"]
-    B --> C["compile program to TT execution metadata"]
-    C --> D["load canonical state onto device"]
-    D --> E["run grouped sweep loop"]
-    E --> F["gather block inputs from device state"]
-    F --> G["compute parameters with TT-MLIR family op"]
-    G --> H["sample new block values"]
-    H --> I["write updated block state back to device"]
-    I --> J["materialize samples / observations to host"]
+    A["THRML program + schedule"] --> B["tt_thrml.api"]
+    B --> C["BackendBinding"]
+    C --> D["backend_executor"]
+    D --> E["CompiledProgram"]
+    D --> F["TTProgramExecutor / TTMeshProgramExecutor"]
+    E --> F
+    F --> G["state_runtime"]
+    F --> H["observation_runtime"]
+    F --> I["family_handlers"]
+    I --> J["TT-MLIR parameter kernels"]
+    I --> K["TTNN runtime primitives"]
+    J --> L["StableHLO -> TTIR -> TTNN -> TTRT"]
 ```
 
-## What Stays Where
+## Sweep Flow
 
-TT-MLIR is used for the parameter-math part of sampling:
+```mermaid
+flowchart TD
+    A["run_sweep(...)"] --> B["prepare block random buffers"]
+    B --> C["for sampling group"]
+    C --> D["for block"]
+    D --> E["gather interaction sources from device state"]
+    E --> F["compute_block_parameters(...)"]
+    F --> G["sample block"]
+    G --> H["stage pending block update"]
+    H --> I["write group updates to canonical device state"]
+    I --> J{"more groups?"}
+    J -->|yes| C
+    J -->|no| K["observe / materialize outputs"]
+```
 
-- spin -> gamma
-- categorical -> theta
-- gaussian -> canonical parameters
+## Parameter-Kernel Boundary
 
-`tt-thrml` keeps the runtime parts:
+The parameter-kernel layer is the main TT-MLIR boundary.
 
-- grouped sweep ordering
-- device-resident state
-- RNG splitting
-- buffered writes at group boundaries
-- sampler-state updates
-- observation and host readback
+- The compiler emits per-block runtime metadata and physical tensor specs.
+- The executor builds one block payload from grouped interactions.
+- The family handler launches one block parameter op.
+- The TT-MLIR bridge uses cached metadata/signatures and direct TTNN runtime bridging as the default contract.
 
-That split is the core design choice in this repo.
+The executor still owns schedule iteration, state writes, and observation.
 
-## Supported Shape
+## Device Ownership
 
-The supported execution surface today is the THRML sampling path:
+- TTNN devices passed in by the caller stay caller-owned.
+- `MeshDevice`s passed in by the caller stay caller-owned.
+- Executors borrow those devices.
+- TT-MLIR runtime sessions opened internally are owned and closed by `tt-thrml`.
 
-- spin
-- categorical
-- gaussian
-- mixed sampling programs built from those families
+## RNG Contract
 
-Custom samplers and interactions can work when they lower cleanly onto that execution model.
-The unsupported part today is the upstream training / moment-estimation side, not the core
-sampling runtime.
-
-## Multi-Device
-
-There is a multi-device path through TT `MeshDevice`.
-
-Today that means:
-
-- one process
-- explicit TT mesh placement/composition
-- a clean executor boundary for multi-device work
-
-It does not yet mean a fully sharded multi-Wormhole sweep engine.
+Sampling randomness is prepared per block across the requested iteration interval, uploaded once, and consumed by iteration offset. The root JAX key maps deterministically to `(iteration, block)` sample keys, so runs remain reproducible without rebuilding tiny random tensors inside the sweep hot path.

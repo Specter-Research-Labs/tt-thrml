@@ -141,26 +141,24 @@ def _run_many_jobs(
         backend=binding,
         options=resolved_options,
     )
-    result = run(coordinator)
-    _emit_progress(
-        resolved_options.progress,
-        f"[tt-thrml.api] {progress_name}:done",
-    )
-    return result
+    try:
+        result = run(coordinator)
+        _emit_progress(
+            resolved_options.progress,
+            f"[tt-thrml.api] {progress_name}:done",
+        )
+        return result
+    finally:
+        if not resolved_options.cacheable:
+            coordinator.shutdown()
 
 
 def _auto_clamp_group_ids(state_clamps: Sequence) -> list[int]:
-    group_index_by_identity: dict[tuple[int, ...], int] = {}
     group_index_by_key: dict[tuple[tuple[str, tuple[int, ...], bytes], ...], int] = {}
     group_ids = []
     for state_clamp in state_clamps:
-        identity_key = tuple(id(value) for value in state_clamp)
-        if identity_key in group_index_by_identity:
-            group_ids.append(group_index_by_identity[identity_key])
-            continue
         key = _clamp_group_key(state_clamp)
         group_id = group_index_by_key.setdefault(key, len(group_index_by_key))
-        group_index_by_identity[identity_key] = group_id
         group_ids.append(group_id)
     return group_ids
 

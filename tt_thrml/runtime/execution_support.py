@@ -55,7 +55,7 @@ class RuntimeProfile:
 class PreparedRunRandoms:
     iteration_keys: tuple[object, ...]
     sample_keys: tuple[tuple[object, ...], ...]
-    prepared_randoms_by_block: dict[int, tuple[object, ...]]
+    prepared_randoms_by_block: dict[int, object]
 
 
 @dataclass(frozen=True)

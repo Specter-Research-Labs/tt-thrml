@@ -1,5 +1,11 @@
 from pathlib import Path
-import torch
+
+try:
+    import torch
+except ImportError:
+    from tests.parity._torch_stub import install_torch_stub
+
+    torch = install_torch_stub()
 
 from tt_thrml.compiler.gaussian_ops import (
     GaussianCanonicalInputs,
@@ -26,6 +32,19 @@ def test_ttmlir_gaussian_canonical_inputs_stablehlo_mentions_stablehlo_ops():
         n_nodes=2,
         n_interactions=3,
         contribution_kind="linear",
+    )
+
+    assert "stablehlo" in text
+
+
+def test_ttmlir_gaussian_canonical_tail_lowering_accepts_four_dim_interaction_scale():
+    text = lower_gaussian_canonical_inputs_to_stablehlo(
+        flat_weights=torch.ones((1, 1, 8, 5, 5), dtype=torch.float32),
+        flat_index=torch.zeros((1, 1, 8, 5, 1), dtype=torch.uint32),
+        interaction_scale=torch.ones((1, 1, 8, 5), dtype=torch.float32),
+        n_nodes=8,
+        n_interactions=5,
+        contribution_kind="precision",
     )
 
     assert "stablehlo" in text
@@ -123,6 +142,10 @@ def test_ttmlir_gaussian_canonical_op_caches_compilation_and_matches_dense_path(
         "tt_thrml.compiler.ttmlir.gaussian_canonical.run_flatbuffer",
         fake_run,
     )
+    monkeypatch.setattr(
+        "tt_thrml.compiler.ttmlir.gaussian_canonical.supports_direct_ttnn_inputs",
+        lambda *, device=None: True,
+    )
 
     op_a = make_ttmlir_gaussian_canonical_op(
         config=TTMLIRConfig(
@@ -150,7 +173,7 @@ def test_ttmlir_gaussian_canonical_op_caches_compilation_and_matches_dense_path(
     assert len(compile_calls) == 1
     assert len(run_calls) == 2
     assert run_calls == [((1, 1, 1, 1, 3), (1, 1, 1, 1, 1), (1, 1, 1, 1, 1))] * 2
-    assert fake_ttnn.to_torch_calls == 6
+    assert fake_ttnn.to_torch_calls == 0
 
 
 def test_ttmlir_gaussian_canonical_signature_distinguishes_contribution_kind():

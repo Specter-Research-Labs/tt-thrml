@@ -8,9 +8,11 @@ from jax import numpy as jnp
 import numpy as np
 import torch
 
+from .device_contract import HostFallbackError, raise_host_fallback_disabled
 from .ttnn_kernels import select_last_dim_expected
 
 from ..runtime.runtime_utils import seed_from_jax_key
+from ..tensor_specs import _first_available_attr
 
 
 def tail_strides(shape: Sequence[int]) -> tuple[int, ...]:
@@ -171,7 +173,7 @@ def _device_layout_for_like(ttnn, value: object):
     layout = getattr(value, "layout", None)
     if layout is not None:
         return layout
-    return getattr(ttnn, "ROW_MAJOR_LAYOUT", getattr(ttnn, "TILE_LAYOUT", None))
+    return _first_available_attr(ttnn, "ROW_MAJOR_LAYOUT", "TILE_LAYOUT")
 
 
 def _device_dtype_for_like(ttnn, value: object):
@@ -204,21 +206,12 @@ def dense_categorical_theta_op(
 ):
     selected = inputs.flat_weights
     if inputs.flat_index is not None:
-        tt_index = inputs.flat_index
-        if inputs.n_categories > 1:
-            tt_index = ttnn.repeat(
-                tt_index,
-                (1, 1, inputs.n_categories, 1),
-            )
-        selected_host = select_last_dim_expected(
-            ttnn.to_torch(selected),
-            ttnn.to_torch(tt_index).to(torch.int64),
-        )
-        selected = ttnn.from_torch(
-            selected_host,
-            dtype=getattr(inputs.flat_weights, "dtype", None),
-            layout=getattr(inputs.flat_weights, "layout", None),
-            device=device,
+        raise_host_fallback_disabled(
+            "native categorical tail selection",
+            remedy=(
+                "Use the TT-MLIR parameter-kernel backend for categorical blocks with "
+                "indexed categorical tails."
+            ),
         )
 
     scaled = ttnn.multiply(selected, inputs.interaction_scale)
@@ -292,7 +285,7 @@ def compile_ttnn_categorical_sampling_plan(
         return None
 
     padded_categories = 32
-    index_dtype = getattr(ttnn, "uint32", getattr(ttnn, "int32"))
+    index_dtype = _first_available_attr(ttnn, "uint32", "int32")
     index_values = (
         torch.arange(padded_categories, dtype=torch.int64)
         .reshape(1, 1, 1, padded_categories)
@@ -320,7 +313,7 @@ def compile_ttnn_categorical_sampling_plan(
         ),
         k=ttnn.from_torch(
             k_values,
-            dtype=getattr(ttnn, "uint32", getattr(ttnn, "int32")),
+            dtype=_first_available_attr(ttnn, "uint32", "int32"),
             layout=ttnn.ROW_MAJOR_LAYOUT,
             device=device,
         ),
@@ -339,25 +332,6 @@ def compile_ttnn_categorical_sampling_plan(
     )
 
 
-def host_categorical_sampler(
-    *,
-    ttnn,
-    device,
-    logits: object,
-    key,
-    output_dtype,
-    plan: TTNNCategoricalSamplingPlan | None,
-    gumbel_noise: object | None = None,
-) -> object:
-    del gumbel_noise
-    n_categories = plan.n_categories if plan is not None else logits.shape[-1]
-    logits_torch = (
-        ttnn.to_torch(logits).detach().cpu().to(torch.float32).reshape(-1, n_categories)
-    )
-    theta = jnp.asarray(logits_torch.numpy(), dtype=jnp.float32)
-    return jax.random.categorical(key, theta, axis=-1).astype(output_dtype)
-
-
 def exact_ttnn_categorical_sampler(
     *,
     ttnn,
@@ -369,11 +343,15 @@ def exact_ttnn_categorical_sampler(
     gumbel_noise: object | None = None,
 ):
     del output_dtype, plan
+    if gumbel_noise is None:
+        raise HostFallbackError(
+            "exact_ttnn_categorical_sampler requires explicit gumbel noise; "
+            "implicit host-side categorical RNG is disabled."
+        )
     argmax = getattr(ttnn, "argmax", None)
     if not callable(argmax):
         raise TypeError(
-            "TT backend must expose argmax() for exact TT categorical sampling. "
-            "Use host_categorical_sampler() explicitly for host fallback."
+            "TT backend must expose argmax() for exact TT categorical sampling."
         )
 
     shape = getattr(logits, "shape", None)
@@ -382,22 +360,7 @@ def exact_ttnn_categorical_sampler(
 
     n_users = int(shape[2])
     n_categories = int(shape[3])
-    gumbels_tt = gumbel_noise
-    if gumbels_tt is None:
-        gumbels = jax.random.gumbel(
-            key,
-            shape=(n_users, n_categories),
-            dtype=jnp.float32,
-        )
-        gumbels_tt = ttnn.from_torch(
-            torch.from_numpy(np.asarray(gumbels, dtype=np.float32).copy()).reshape(
-                1, 1, n_users, n_categories
-            ),
-            dtype=_device_dtype_for_like(ttnn, logits),
-            layout=_device_layout_for_like(ttnn, logits),
-            device=device,
-        )
-    noisy_logits = ttnn.add(logits, gumbels_tt)
+    noisy_logits = ttnn.add(logits, gumbel_noise)
     sampled = argmax(noisy_logits, dim=-1, keepdim=False)
     sampled = ttnn.reshape(sampled, (1, 1, 1, n_users))
     sampled = _maybe_to_layout(
@@ -408,9 +371,26 @@ def exact_ttnn_categorical_sampler(
     sampled = _ttnn_cast(
         ttnn=ttnn,
         value=sampled,
-        dtype=getattr(ttnn, "uint32", getattr(ttnn, "int32")),
+        dtype=_first_available_attr(ttnn, "uint32", "int32"),
     )
     return sampled
+
+
+def categorical_gumbel_noise_tensor(keys, *, n_users: int, n_categories: int) -> torch.Tensor:
+    gumbel = np.asarray(
+        [
+            jax.random.gumbel(
+                key,
+                shape=(int(n_users), int(n_categories)),
+                dtype=jnp.float32,
+            )
+            for key in keys
+        ],
+        dtype=np.float32,
+    )
+    return torch.from_numpy(gumbel.copy()).reshape(
+        len(keys), 1, int(n_users), int(n_categories)
+    )
 
 
 def ttnn_categorical_sampler(
@@ -426,8 +406,7 @@ def ttnn_categorical_sampler(
     del gumbel_noise, output_dtype
     if plan is None:
         raise ValueError(
-            "TTNN categorical sampling requires a compiled TTNN sampling plan. "
-            "Use host_categorical_sampler() explicitly for host fallback."
+            "TTNN categorical sampling requires a compiled TTNN sampling plan."
         )
     sampling = getattr(ttnn, "sampling", None)
     if not callable(sampling):
@@ -482,5 +461,5 @@ def ttnn_categorical_sampler(
     return _ttnn_cast(
         ttnn=ttnn,
         value=ttnn.reshape(sampled, (1, 1, 1, plan.n_users)),
-        dtype=getattr(ttnn, "uint32", getattr(ttnn, "int32")),
+        dtype=_first_available_attr(ttnn, "uint32", "int32"),
     )

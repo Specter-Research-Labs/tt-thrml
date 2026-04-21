@@ -15,6 +15,7 @@ from .sampler_lowering import (
     resolve_sampler_lowering_config,
     unsupported_sampler_message,
 )
+from .spin_ops import SPIN_PARAMETER_TO_GAMMA_SCALE
 from ..runtime_config import (
     CATEGORICAL_PARAMETER_FAMILY,
     GAUSSIAN_PARAMETER_FAMILY,
@@ -34,11 +35,26 @@ from ..runtime.compiled_program import (
     CompiledGaussianFamilyRuntime,
     CompiledInteraction,
     CompiledInteractionExecution,
+    CompiledInteractionGroup,
     CompiledInteractionSource,
     CompiledProgram,
     CompiledStateView,
     CompiledSpinFamilyRuntime,
     node_kind_from_template,
+)
+from ..tensor_specs import (
+    _first_available_attr,
+    block_state_tensor_spec,
+    categorical_active_mask_group_tensor_spec,
+    categorical_active_mask_tensor_spec,
+    categorical_parameter_tensor_spec,
+    categorical_weight_group_tensor_spec,
+    categorical_weight_tensor_spec,
+    gathered_source_tensor_spec,
+    gaussian_parameter_tensor_spec,
+    interaction_scale_tensor_spec,
+    spin_gaussian_weight_tensor_spec,
+    spin_parameter_tensor_spec,
 )
 
 
@@ -54,7 +70,7 @@ class _CompileContext:
 
 
 def _make_compile_context(*, ttnn, device) -> _CompileContext:
-    state_layout = getattr(ttnn, "TILE_LAYOUT", getattr(ttnn, "ROW_MAJOR_LAYOUT"))
+    state_layout = _first_available_attr(ttnn, "TILE_LAYOUT", "ROW_MAJOR_LAYOUT")
     categorical_layout = getattr(ttnn, "ROW_MAJOR_LAYOUT", state_layout)
     spin_state_dtype = getattr(ttnn, "bfloat16")
     index_dtype = getattr(ttnn, "uint32", None)
@@ -133,6 +149,11 @@ def _compile_state_views(
             layout=context.state_layout,
             device=context.device,
         )
+        device_dtype_for_node_kind = (
+            context.categorical_state_dtype
+            if node_kind == "categorical"
+            else context.spin_state_dtype
+        )
         state_views.append(
             CompiledStateView(
                 block_index=block_index,
@@ -143,6 +164,15 @@ def _compile_state_views(
                 positions=positions_np,
                 gather_index=gather_index,
                 host_gather_index=host_gather_index,
+                tensor_spec=block_state_tensor_spec(
+                    n_nodes=len(block.nodes),
+                    layout=(
+                        context.categorical_layout
+                        if node_kind == "categorical"
+                        else context.state_layout
+                    ),
+                    dtype=device_dtype_for_node_kind,
+                ),
             )
         )
     return state_views
@@ -237,7 +267,6 @@ def _compile_interaction_execution(
     prefer_row_major: bool,
     row_major_cache_block_indices: set[int],
 ) -> CompiledInteractionExecution:
-    target_shape_tail = (n_nodes, source_n_interactions, 1)
     spin_sources = []
     categorical_sources = []
     continuous_sources = []
@@ -247,17 +276,25 @@ def _compile_interaction_execution(
             shard = source.shards[0]
             source_plan = CompiledDirectSourcePlan(
                 block_index=shard.block_index,
-                target_shape_tail=target_shape_tail,
-                output_layout=output_layout,
                 use_row_major=prefer_row_major,
+                tensor_spec=gathered_source_tensor_spec(
+                    n_nodes=n_nodes,
+                    n_interactions=source_n_interactions,
+                    layout=output_layout,
+                    dtype=None,
+                ),
             )
             if prefer_row_major:
                 row_major_cache_block_indices.add(shard.block_index)
         else:
             source_plan = CompiledGatherSourcePlan(
                 shards=source.shards,
-                target_shape_tail=target_shape_tail,
-                output_layout=output_layout,
+                tensor_spec=gathered_source_tensor_spec(
+                    n_nodes=n_nodes,
+                    n_interactions=source_n_interactions,
+                    layout=output_layout,
+                    dtype=None,
+                ),
             )
 
         if source_position < n_spin:
@@ -283,6 +320,268 @@ def _float_tensor(context: _CompileContext, values, *, layout):
     )
 
 
+def _concat_tensors(context: _CompileContext, tensors, *, dim: int):
+    if len(tensors) == 1:
+        return tensors[0]
+    return context.ttnn.concat(list(tensors), dim=dim)
+
+
+def _group_signature(interaction: CompiledInteraction) -> tuple[object, ...]:
+    return (
+        interaction.contribution_kind,
+    )
+
+
+def _pad_last_dim(
+    context: _CompileContext,
+    tensor,
+    *,
+    target_size: int,
+    layout,
+    dtype,
+):
+    current_shape = tuple(int(dim) for dim in tensor.shape)
+    current_size = int(current_shape[-1])
+    if current_size >= target_size:
+        return tensor
+    padding_shape = (*current_shape[:-1], target_size - current_size)
+    padding = context.ttnn.full(
+        list(padding_shape),
+        fill_value=0.0,
+        dtype=dtype,
+        layout=layout,
+        device=context.device,
+    )
+    return context.ttnn.concat([tensor, padding], dim=len(current_shape) - 1)
+
+
+def _promote_spin_or_gaussian_group_weight(
+    *,
+    context: _CompileContext,
+    interaction: CompiledInteraction,
+    target_tail_size: int,
+):
+    weight = interaction.flat_weights
+    if target_tail_size <= 1:
+        return weight
+    if len(tuple(weight.shape)) == 4:
+        weight = context.ttnn.reshape(
+            weight,
+            (
+                int(weight.shape[0]),
+                int(weight.shape[1]),
+                int(weight.shape[2]),
+                int(weight.shape[3]),
+                1,
+            ),
+        )
+    return _pad_last_dim(
+        context,
+        weight,
+        target_size=target_tail_size,
+        layout=interaction.flat_weights_spec.layout,
+        dtype=interaction.flat_weights_spec.dtype,
+    )
+
+
+def _promote_spin_or_gaussian_group_mask(
+    *,
+    context: _CompileContext,
+    interaction: CompiledInteraction,
+    target_has_tail: bool,
+):
+    active_mask = interaction.active_mask
+    if not target_has_tail or len(tuple(active_mask.shape)) == 5:
+        return active_mask
+    return context.ttnn.reshape(
+        active_mask,
+        (
+            int(active_mask.shape[0]),
+            int(active_mask.shape[1]),
+            int(active_mask.shape[2]),
+            int(active_mask.shape[3]),
+            1,
+        ),
+    )
+
+
+def _promote_categorical_group_weight(
+    *,
+    context: _CompileContext,
+    interaction: CompiledInteraction,
+    target_tail_size: int,
+):
+    weight = interaction.flat_weights
+    if target_tail_size <= 1:
+        return weight
+    return _pad_last_dim(
+        context,
+        weight,
+        target_size=target_tail_size,
+        layout=interaction.flat_weights_spec.layout,
+        dtype=interaction.flat_weights_spec.dtype,
+    )
+
+
+def _compile_spin_or_gaussian_interaction_group(
+    *,
+    interactions: list[CompiledInteraction],
+    context: _CompileContext,
+) -> CompiledInteraction | CompiledInteractionGroup:
+    if len(interactions) == 1:
+        return interactions[0]
+
+    exemplar = interactions[0]
+    total_interactions = sum(interaction.n_interactions for interaction in interactions)
+    n_nodes = exemplar.parameter_spec.shape_tail[1]
+    tail_size = max(math.prod(interaction.tail_shape) or 1 for interaction in interactions)
+    has_tail = tail_size > 1
+    parameter_spec = interaction_scale_tensor_spec(
+        n_nodes=n_nodes,
+        n_interactions=total_interactions,
+        has_tail=has_tail,
+        layout=exemplar.parameter_spec.layout,
+        dtype=exemplar.parameter_spec.dtype,
+    )
+    return CompiledInteractionGroup(
+        interactions=tuple(interactions),
+        n_interactions=total_interactions,
+        flat_weights=_concat_tensors(
+            context,
+            [
+                _promote_spin_or_gaussian_group_weight(
+                    context=context,
+                    interaction=interaction,
+                    target_tail_size=tail_size,
+                )
+                for interaction in interactions
+            ],
+            dim=3,
+        ),
+        active_mask=_concat_tensors(
+            context,
+            [
+                _promote_spin_or_gaussian_group_mask(
+                    context=context,
+                    interaction=interaction,
+                    target_has_tail=has_tail,
+                )
+                for interaction in interactions
+            ],
+            dim=3,
+        ),
+        flat_indices=None,
+        parameter_spec=parameter_spec,
+        flat_weights_spec=spin_gaussian_weight_tensor_spec(
+            n_nodes=n_nodes,
+            n_interactions=total_interactions,
+            tail_size=tail_size,
+            layout=exemplar.flat_weights_spec.layout,
+            dtype=exemplar.flat_weights_spec.dtype,
+        ),
+        active_mask_spec=parameter_spec,
+    )
+
+
+def _compile_categorical_interaction_group(
+    *,
+    interactions: list[CompiledInteraction],
+    context: _CompileContext,
+) -> CompiledInteraction | CompiledInteractionGroup:
+    if len(interactions) == 1:
+        return interactions[0]
+
+    exemplar = interactions[0]
+    n_nodes = exemplar.parameter_spec.shape_tail[1]
+    total_interactions = sum(interaction.n_interactions for interaction in interactions)
+    n_categories = exemplar.flat_weights_spec.shape_tail[1]
+    tail_size = max(interaction.flat_weights_spec.shape_tail[2] for interaction in interactions)
+
+    flat_weights_group = _concat_tensors(
+        context,
+        [
+            _promote_categorical_group_weight(
+                context=context,
+                interaction=interaction,
+                target_tail_size=tail_size,
+            )
+            for interaction in interactions
+        ],
+        dim=1,
+    )
+    active_mask_group = _concat_tensors(
+        context,
+        [interaction.active_mask for interaction in interactions],
+        dim=1,
+    )
+    return CompiledInteractionGroup(
+        interactions=tuple(interactions),
+        n_interactions=total_interactions,
+        flat_weights=flat_weights_group,
+        active_mask=active_mask_group,
+        flat_indices=None,
+        parameter_spec=interaction_scale_tensor_spec(
+            n_nodes=n_nodes,
+            n_interactions=total_interactions,
+            has_tail=bool(exemplar.tail_shape),
+            layout=exemplar.parameter_spec.layout,
+            dtype=exemplar.parameter_spec.dtype,
+        ),
+        flat_weights_spec=categorical_weight_tensor_spec(
+            n_nodes=n_nodes,
+            n_interactions=total_interactions,
+            n_categories=n_categories,
+            tail_size=tail_size,
+            layout=exemplar.flat_weights_spec.layout,
+            dtype=exemplar.flat_weights_spec.dtype,
+        ),
+        active_mask_spec=categorical_active_mask_tensor_spec(
+            n_nodes=n_nodes,
+            n_interactions=total_interactions,
+            layout=exemplar.active_mask_spec.layout,
+            dtype=exemplar.active_mask_spec.dtype,
+        ),
+    )
+
+
+def _group_compiled_interactions(
+    *,
+    interactions: tuple[CompiledInteraction, ...],
+    context: _CompileContext,
+    parameter_family,
+) -> tuple[CompiledInteraction | CompiledInteractionGroup, ...]:
+    if len(interactions) <= 1:
+        return interactions
+
+    grouped_by_signature: dict[tuple[object, ...], list[CompiledInteraction]] = {}
+    signature_order: list[tuple[object, ...]] = []
+    for interaction in interactions:
+        signature = _group_signature(interaction)
+        if signature not in grouped_by_signature:
+            grouped_by_signature[signature] = []
+            signature_order.append(signature)
+        grouped_by_signature[signature].append(interaction)
+
+    grouped_interactions: list[CompiledInteraction | CompiledInteractionGroup] = []
+    for signature in signature_order:
+        bucket = grouped_by_signature[signature]
+        if parameter_family == CATEGORICAL_PARAMETER_FAMILY:
+            grouped_interactions.append(
+                _compile_categorical_interaction_group(
+                    interactions=bucket,
+                    context=context,
+                )
+            )
+        else:
+            grouped_interactions.append(
+                _compile_spin_or_gaussian_interaction_group(
+                    interactions=bucket,
+                    context=context,
+                )
+            )
+    return tuple(grouped_interactions)
+
+
 def _compile_spin_block(
     *,
     program: BlockSamplingProgram,
@@ -305,6 +604,21 @@ def _compile_spin_block(
         active_np = np.asarray(lowered_interaction.active_mask, dtype=np.float32)
         n_nodes, n_interactions = active_np.shape
         tail_shape = lowered_interaction.tail_shape
+        tail_size = math.prod(tail_shape) or 1
+        parameter_spec = interaction_scale_tensor_spec(
+            n_nodes=n_nodes,
+            n_interactions=n_interactions,
+            has_tail=bool(tail_shape),
+            layout=context.state_layout,
+            dtype=context.spin_state_dtype,
+        )
+        flat_weights_spec = spin_gaussian_weight_tensor_spec(
+            n_nodes=n_nodes,
+            n_interactions=n_interactions,
+            tail_size=tail_size,
+            layout=context.state_layout,
+            dtype=context.spin_state_dtype,
+        )
         sources = _compile_interaction_sources(
             lowered_interaction=lowered_interaction,
             global_slots=global_slots,
@@ -313,24 +627,21 @@ def _compile_spin_block(
         )
 
         if tail_shape:
-            flat_weights = (2.0 * lowered_interaction.contribution.weights).reshape(
+            flat_weights = (
+                SPIN_PARAMETER_TO_GAMMA_SCALE * lowered_interaction.contribution.weights
+            ).reshape(
                 1,
-                1,
-                n_nodes,
-                n_interactions,
-                math.prod(tail_shape) or 1,
+                *flat_weights_spec.shape_tail,
             )
-            active_mask = active_np.reshape(1, 1, n_nodes, n_interactions, 1)
-            parameter_scale_shape_tail = (1, n_nodes, n_interactions, 1)
+            active_mask = active_np.reshape(1, *parameter_spec.shape_tail)
         else:
-            flat_weights = (2.0 * lowered_interaction.contribution.weights).reshape(
+            flat_weights = (
+                SPIN_PARAMETER_TO_GAMMA_SCALE * lowered_interaction.contribution.weights
+            ).reshape(
                 1,
-                1,
-                n_nodes,
-                n_interactions,
+                *flat_weights_spec.shape_tail,
             )
-            active_mask = active_np.reshape(1, 1, n_nodes, n_interactions)
-            parameter_scale_shape_tail = (1, n_nodes, n_interactions)
+            active_mask = active_np.reshape(1, *parameter_spec.shape_tail)
 
         if not sources:
             constant_partial = flat_weights * active_mask
@@ -368,7 +679,9 @@ def _compile_spin_block(
                     layout=context.state_layout,
                 ),
                 active_mask_is_all_ones=bool(np.all(active_np == 1.0)),
-                parameter_scale_shape_tail=parameter_scale_shape_tail,
+                parameter_spec=parameter_spec,
+                flat_weights_spec=flat_weights_spec,
+                active_mask_spec=parameter_spec,
                 fused_static_theta_bias=False,
                 use_single_node_fused_theta_scale_fast_path=False,
                 fused_static_theta_prefix=None,
@@ -398,10 +711,26 @@ def _compile_spin_block(
                     layout=context.state_layout,
                 ),
                 active_mask_is_all_ones=True,
-                parameter_scale_shape_tail=(
-                    1,
+                parameter_spec=interaction_scale_tensor_spec(
                     state_view.n_nodes,
                     int(pending_constant_spin_partial.shape[3]),
+                    has_tail=False,
+                    layout=context.state_layout,
+                    dtype=context.spin_state_dtype,
+                ),
+                flat_weights_spec=spin_gaussian_weight_tensor_spec(
+                    n_nodes=state_view.n_nodes,
+                    n_interactions=int(pending_constant_spin_partial.shape[3]),
+                    tail_size=1,
+                    layout=context.state_layout,
+                    dtype=context.spin_state_dtype,
+                ),
+                active_mask_spec=interaction_scale_tensor_spec(
+                    n_nodes=state_view.n_nodes,
+                    n_interactions=int(pending_constant_spin_partial.shape[3]),
+                    has_tail=False,
+                    layout=context.state_layout,
+                    dtype=context.spin_state_dtype,
                 ),
                 fused_static_theta_bias=False,
                 use_single_node_fused_theta_scale_fast_path=False,
@@ -410,7 +739,11 @@ def _compile_spin_block(
         )
 
     return (
-        tuple(interactions),
+        _group_compiled_interactions(
+            interactions=tuple(interactions),
+            context=context,
+            parameter_family=SPIN_PARAMETER_FAMILY,
+        ),
         CompiledSpinFamilyRuntime(
             zero_parameters=context.ttnn.full(
                 [1, 1, state_view.n_nodes, 1],
@@ -418,6 +751,11 @@ def _compile_spin_block(
                 dtype=context.spin_state_dtype,
                 layout=context.state_layout,
                 device=context.device,
+            ),
+            parameter_spec=spin_parameter_tensor_spec(
+                n_nodes=state_view.n_nodes,
+                layout=context.state_layout,
+                dtype=context.spin_state_dtype,
             ),
             positive_ones=context.ttnn.full(
                 [1, 1, state_view.n_nodes, 1],
@@ -462,6 +800,28 @@ def _compile_categorical_block(
         n_nodes, n_interactions = active_np.shape
         tail_shape = lowered_interaction.tail_shape
         n_categories = int(lowered_interaction.n_categories)
+        tail_size = math.prod(tail_shape) or 1
+        flat_weights_spec = categorical_weight_tensor_spec(
+            n_nodes=n_nodes,
+            n_interactions=n_interactions,
+            n_categories=n_categories,
+            tail_size=tail_size,
+            layout=context.categorical_layout,
+            dtype=context.spin_state_dtype,
+        )
+        parameter_spec = interaction_scale_tensor_spec(
+            n_nodes=n_nodes,
+            n_interactions=n_interactions,
+            has_tail=bool(tail_shape),
+            layout=context.categorical_layout,
+            dtype=context.spin_state_dtype,
+        )
+        active_mask_spec = categorical_active_mask_tensor_spec(
+            n_nodes=n_nodes,
+            n_interactions=n_interactions,
+            layout=context.categorical_layout,
+            dtype=context.spin_state_dtype,
+        )
         sources = _compile_interaction_sources(
             lowered_interaction=lowered_interaction,
             global_slots=global_slots,
@@ -471,11 +831,9 @@ def _compile_categorical_block(
 
         flat_weights = lowered_interaction.contribution.weights.reshape(
             1,
-            n_nodes * n_interactions,
-            n_categories,
-            math.prod(tail_shape) or 1,
+            *flat_weights_spec.shape_tail,
         )
-        active_mask = active_np.reshape(1, n_nodes * n_interactions, 1, 1)
+        active_mask = active_np.reshape(1, *active_mask_spec.shape_tail)
 
         if not sources:
             constant_partial = (flat_weights * active_mask).reshape(
@@ -559,11 +917,9 @@ def _compile_categorical_block(
                     layout=context.categorical_layout,
                 ),
                 active_mask_is_all_ones=bool(np.all(active_np == 1.0)),
-                parameter_scale_shape_tail=(
-                    (1, n_nodes, n_interactions, 1)
-                    if tail_shape
-                    else (1, n_nodes, n_interactions)
-                ),
+                parameter_spec=parameter_spec,
+                flat_weights_spec=flat_weights_spec,
+                active_mask_spec=active_mask_spec,
                 fused_static_theta_bias=fused_static_theta_bias,
                 use_single_node_fused_theta_scale_fast_path=(
                     fused_static_theta_bias and n_nodes == 1
@@ -574,7 +930,11 @@ def _compile_categorical_block(
 
     n_categories = int(sampler_lowering.n_categories)
     return (
-        tuple(interactions),
+        _group_compiled_interactions(
+            interactions=tuple(interactions),
+            context=context,
+            parameter_family=CATEGORICAL_PARAMETER_FAMILY,
+        ),
         CompiledCategoricalFamilyRuntime(
             zero_parameters=context.ttnn.full(
                 [1, 1, state_view.n_nodes, n_categories],
@@ -597,6 +957,12 @@ def _compile_categorical_block(
                 device=context.device,
                 n_users=state_view.n_nodes,
                 n_categories=n_categories,
+            ),
+            parameter_spec=categorical_parameter_tensor_spec(
+                n_nodes=state_view.n_nodes,
+                n_categories=n_categories,
+                layout=context.categorical_layout,
+                dtype=context.spin_state_dtype,
             ),
         ),
         n_categories,
@@ -624,6 +990,21 @@ def _compile_gaussian_block(
         active_np = np.asarray(lowered_interaction.active_mask, dtype=np.float32)
         n_nodes, n_interactions = active_np.shape
         tail_shape = lowered_interaction.tail_shape
+        tail_size = math.prod(tail_shape) or 1
+        parameter_spec = interaction_scale_tensor_spec(
+            n_nodes=n_nodes,
+            n_interactions=n_interactions,
+            has_tail=bool(tail_shape),
+            layout=context.state_layout,
+            dtype=context.spin_state_dtype,
+        )
+        flat_weights_spec = spin_gaussian_weight_tensor_spec(
+            n_nodes=n_nodes,
+            n_interactions=n_interactions,
+            tail_size=tail_size,
+            layout=context.state_layout,
+            dtype=context.spin_state_dtype,
+        )
         sources = _compile_interaction_sources(
             lowered_interaction=lowered_interaction,
             global_slots=global_slots,
@@ -634,22 +1015,15 @@ def _compile_gaussian_block(
         if tail_shape:
             flat_weights = lowered_interaction.contribution.weights.reshape(
                 1,
-                1,
-                n_nodes,
-                n_interactions,
-                math.prod(tail_shape) or 1,
+                *flat_weights_spec.shape_tail,
             )
-            active_mask = active_np.reshape(1, 1, n_nodes, n_interactions, 1)
-            parameter_scale_shape_tail = (1, n_nodes, n_interactions, 1)
+            active_mask = active_np.reshape(1, *parameter_spec.shape_tail)
         else:
             flat_weights = lowered_interaction.contribution.weights.reshape(
                 1,
-                1,
-                n_nodes,
-                n_interactions,
+                *flat_weights_spec.shape_tail,
             )
-            active_mask = active_np.reshape(1, 1, n_nodes, n_interactions)
-            parameter_scale_shape_tail = (1, n_nodes, n_interactions)
+            active_mask = active_np.reshape(1, *parameter_spec.shape_tail)
 
         interactions.append(
             CompiledInteraction(
@@ -677,7 +1051,9 @@ def _compile_gaussian_block(
                     layout=context.state_layout,
                 ),
                 active_mask_is_all_ones=bool(np.all(active_np == 1.0)),
-                parameter_scale_shape_tail=parameter_scale_shape_tail,
+                parameter_spec=parameter_spec,
+                flat_weights_spec=flat_weights_spec,
+                active_mask_spec=parameter_spec,
                 fused_static_theta_bias=False,
                 use_single_node_fused_theta_scale_fast_path=False,
                 fused_static_theta_prefix=None,
@@ -685,7 +1061,11 @@ def _compile_gaussian_block(
         )
 
     return (
-        tuple(interactions),
+        _group_compiled_interactions(
+            interactions=tuple(interactions),
+            context=context,
+            parameter_family=GAUSSIAN_PARAMETER_FAMILY,
+        ),
         CompiledGaussianFamilyRuntime(
             zero_parameters=context.ttnn.full(
                 [1, 1, state_view.n_nodes, 2],
@@ -701,6 +1081,11 @@ def _compile_gaussian_block(
                     (1, 1, state_view.n_nodes, 2),
                 ),
                 layout=context.state_layout,
+            ),
+            parameter_spec=gaussian_parameter_tensor_spec(
+                n_nodes=state_view.n_nodes,
+                layout=context.state_layout,
+                dtype=context.spin_state_dtype,
             ),
             precision_selector=_float_tensor(
                 context,

@@ -1,6 +1,11 @@
 from pathlib import Path
 
-import torch
+try:
+    import torch
+except ImportError:
+    from tests.parity._torch_stub import install_torch_stub
+
+    torch = install_torch_stub()
 
 from tt_thrml.compiler.categorical_ops import CategoricalThetaInputs, dense_categorical_theta_op
 from tt_thrml.compiler.discrete_ebm_packing import PackedCategoricalThetaBatch
@@ -134,7 +139,7 @@ def test_ttmlir_categorical_theta_op_caches_compilation_and_matches_dense_path(
 
     def fake_run(paths, *, flatbuffer_path, input_tensors, device=None, prefer_device_output=False):
         del paths, flatbuffer_path, device
-        assert prefer_device_output is False
+        assert prefer_device_output is True
         run_calls.append(tuple(tuple(t.shape) for t in input_tensors))
         if len(input_tensors) == 3:
             flat_weights, flat_index, interaction_scale = input_tensors
@@ -166,6 +171,10 @@ def test_ttmlir_categorical_theta_op_caches_compilation_and_matches_dense_path(
         "tt_thrml.compiler.ttmlir.categorical_theta.run_flatbuffer",
         fake_run,
     )
+    monkeypatch.setattr(
+        "tt_thrml.compiler.ttmlir.categorical_theta.supports_direct_ttnn_inputs",
+        lambda *, device=None: True,
+    )
 
     op_a = make_ttmlir_categorical_theta_op(
         config=TTMLIRConfig(
@@ -188,7 +197,7 @@ def test_ttmlir_categorical_theta_op_caches_compilation_and_matches_dense_path(
     assert torch.allclose(result_b, expected)
     assert len(compile_calls) == 1
     assert len(run_calls) == 2
-    assert fake_ttnn.to_torch_calls == 6
+    assert fake_ttnn.to_torch_calls == 0
 
 
 def test_ttmlir_categorical_theta_op_signature_distinguishes_tail_and_dense_shapes():

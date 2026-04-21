@@ -46,6 +46,7 @@ from tt_thrml.compiler.categorical_ops import (
     exact_ttnn_categorical_sampler,
     ttnn_categorical_sampler,
 )
+from tt_thrml.compiler.device_contract import HostFallbackError
 
 
 @dataclass
@@ -167,8 +168,8 @@ def test_ttnn_categorical_sampler_requires_explicit_sampling_plan():
         )
 
 
-def test_exact_ttnn_categorical_sampler_requires_argmax():
-    with pytest.raises(TypeError, match="must expose argmax"):
+def test_exact_ttnn_categorical_sampler_requires_explicit_gumbel_noise():
+    with pytest.raises(HostFallbackError, match="requires explicit gumbel noise"):
         exact_ttnn_categorical_sampler(
             ttnn=TinyTTNN(),
             device="fake",
@@ -176,6 +177,24 @@ def test_exact_ttnn_categorical_sampler_requires_argmax():
             key=object(),
             output_dtype="u32",
             plan=None,
+        )
+
+
+def test_exact_ttnn_categorical_sampler_requires_argmax():
+    logits = TinyTensor(
+        value=np.zeros((1, 1, 2, 3), dtype=np.float32),
+        dtype="bf16",
+        layout=TinyTTNN.ROW_MAJOR_LAYOUT,
+    )
+    with pytest.raises(TypeError, match="must expose argmax"):
+        exact_ttnn_categorical_sampler(
+            ttnn=TinyTTNN(),
+            device="fake",
+            logits=logits,
+            key=object(),
+            output_dtype="u32",
+            plan=None,
+            gumbel_noise=logits,
         )
 
 

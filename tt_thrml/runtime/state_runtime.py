@@ -9,6 +9,7 @@ import torch
 
 from thrml.block_management import Block, get_node_locations, verify_block_state
 
+from ..compiler.device_contract import raise_host_fallback_disabled
 from ..compiler.sampler_lowering import CompiledSamplerStateSpec
 from .compiled_program import CompiledBlock, CompiledStateView, node_kind_from_template
 from .mesh_support import (
@@ -22,6 +23,7 @@ from .runtime_utils import (
     categorical_state_from_index_torch,
     signed_spin_tensor,
 )
+from ..tensor_specs import block_state_tensor_spec
 
 
 def _host_flat_torch_tensor(array: np.ndarray, *, batch_size: int | None = None) -> torch.Tensor:
@@ -235,7 +237,20 @@ def device_tensor_for_sampler_state_spec_batch(
 
 def sample_is_device_tensor(executor, sample) -> bool:
     shape = getattr(sample, "shape", None)
-    return shape is not None and len(shape) == 4
+    if shape is None or len(shape) != 4:
+        return False
+    sample_type_module = getattr(type(sample), "__module__", "")
+    if sample_type_module.startswith("numpy"):
+        return False
+    try:
+        import torch
+
+        tensor_type = getattr(torch, "Tensor", None)
+        if tensor_type is not None and tensor_type is not object and isinstance(sample, tensor_type):
+            return False
+    except (ImportError, ModuleNotFoundError):
+        pass
+    return hasattr(sample, "layout") and hasattr(sample, "dtype")
 
 
 def maybe_to_layout(executor, value, layout):
@@ -317,13 +332,11 @@ def coerce_rank4_ttnn_tensor(
         ):
             return reshaped
 
-        host_tensor = device_tensor_to_torch(executor, reshaped)
-        return executor.ttnn.from_torch(
-            host_tensor.contiguous(),
-            **_device_upload_kwargs(
-                executor,
-                dtype=target_dtype,
-                layout=layout,
+        raise_host_fallback_disabled(
+            "rank-4 TTNN tensor coercion",
+            remedy=(
+                "Pass tensors that already match the compiled shape/layout/dtype, "
+                "or provide host values at the explicit API boundary."
             ),
         )
 
@@ -707,6 +720,19 @@ def view_for_block(executor, block: Block) -> CompiledStateView:
         positions=positions_np,
         gather_index=gather_index,
         host_gather_index=host_gather_index,
+        tensor_spec=block_state_tensor_spec(
+            n_nodes=len(block.nodes),
+            layout=(
+                executor.compiled.categorical_layout
+                if node_kind == "categorical"
+                else executor.compiled.state_layout
+            ),
+            dtype=(
+                executor.compiled.categorical_state_dtype
+                if node_kind == "categorical"
+                else executor.compiled.spin_state_dtype
+            ),
+        ),
     )
 
 

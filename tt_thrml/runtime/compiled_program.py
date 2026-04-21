@@ -8,6 +8,7 @@ import torch
 
 from ..compiler.sampler_lowering import CompiledSamplerLowering
 from ..runtime_config import ParameterKernelBackend
+from ..tensor_specs import PhysicalTensorSpec
 
 
 def node_kind_from_template(template_sd: jax.ShapeDtypeStruct) -> str:
@@ -26,6 +27,7 @@ def node_kind_from_template(template_sd: jax.ShapeDtypeStruct) -> str:
         "TTProgramExecutor currently supports only scalar bool, integer, "
         f"or floating-point node states. Got {template_sd.dtype!r}."
     )
+
 
 @dataclass(frozen=True)
 class CompiledGlobalSlot:
@@ -46,6 +48,7 @@ class CompiledStateView:
     positions: np.ndarray
     gather_index: object
     host_gather_index: torch.Tensor
+    tensor_spec: PhysicalTensorSpec
 
 
 @dataclass(frozen=True)
@@ -68,16 +71,14 @@ class CompiledInteractionSource:
 @dataclass(frozen=True)
 class CompiledDirectSourcePlan:
     block_index: int
-    target_shape_tail: tuple[int, ...]
-    output_layout: object | None
     use_row_major: bool
+    tensor_spec: PhysicalTensorSpec
 
 
 @dataclass(frozen=True)
 class CompiledGatherSourcePlan:
     shards: tuple[CompiledGatherShard, ...]
-    target_shape_tail: tuple[int, ...]
-    output_layout: object | None
+    tensor_spec: PhysicalTensorSpec
 
 
 CompiledInteractionSourcePlan = CompiledDirectSourcePlan | CompiledGatherSourcePlan
@@ -100,10 +101,24 @@ class CompiledInteraction:
     flat_weights: object
     active_mask: object
     active_mask_is_all_ones: bool
-    parameter_scale_shape_tail: tuple[int, ...]
+    parameter_spec: PhysicalTensorSpec
+    flat_weights_spec: PhysicalTensorSpec
+    active_mask_spec: PhysicalTensorSpec
     fused_static_theta_bias: bool
     use_single_node_fused_theta_scale_fast_path: bool
     fused_static_theta_prefix: object | None
+
+
+@dataclass(frozen=True)
+class CompiledInteractionGroup:
+    interactions: tuple[CompiledInteraction, ...]
+    n_interactions: int
+    flat_weights: object | None
+    active_mask: object | None
+    flat_indices: object | None = None
+    parameter_spec: PhysicalTensorSpec | None = None
+    flat_weights_spec: PhysicalTensorSpec | None = None
+    active_mask_spec: PhysicalTensorSpec | None = None
 
 
 @dataclass(frozen=True)
@@ -111,6 +126,7 @@ class CompiledSpinFamilyRuntime:
     zero_parameters: object
     positive_ones: object
     negative_ones: object
+    parameter_spec: PhysicalTensorSpec
 
 
 @dataclass(frozen=True)
@@ -118,6 +134,7 @@ class CompiledCategoricalFamilyRuntime:
     zero_parameters: object
     static_bias: object | None
     sampling_plan: object | None
+    parameter_spec: PhysicalTensorSpec
 
 
 @dataclass(frozen=True)
@@ -125,6 +142,7 @@ class CompiledGaussianFamilyRuntime:
     zero_parameters: object
     linear_selector: object
     precision_selector: object
+    parameter_spec: PhysicalTensorSpec
 
 
 CompiledFamilyRuntime = (
@@ -143,7 +161,7 @@ class CompiledBlock:
     output_dtype: object
     n_categories: int | None
     state_view: CompiledStateView
-    interactions: tuple[CompiledInteraction, ...]
+    interactions: tuple[CompiledInteraction | CompiledInteractionGroup, ...]
     family_runtime: CompiledFamilyRuntime
 
 
@@ -167,12 +185,13 @@ __all__ = [
     "CompiledGatherShard",
     "CompiledGatherSourcePlan",
     "CompiledGlobalSlot",
+    "CompiledGaussianFamilyRuntime",
     "CompiledInteraction",
     "CompiledInteractionExecution",
+    "CompiledInteractionGroup",
     "CompiledInteractionSource",
     "CompiledProgram",
-    "CompiledGaussianFamilyRuntime",
-    "CompiledStateView",
     "CompiledSpinFamilyRuntime",
+    "CompiledStateView",
     "node_kind_from_template",
 ]

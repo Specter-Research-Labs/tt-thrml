@@ -44,6 +44,26 @@ def spin_threshold_logits_tensor(key, *, n_nodes: int) -> torch.Tensor:
     return torch.from_numpy(threshold_logits_np).reshape(1, 1, int(n_nodes), 1)
 
 
+def spin_threshold_logits_batch_tensor(keys, *, n_nodes: int) -> torch.Tensor:
+    thresholds = []
+    for key in keys:
+        uniform = jax.random.uniform(
+            key,
+            shape=(int(n_nodes),),
+            minval=0.0,
+            maxval=1.0,
+            dtype=jnp.float32,
+        )
+        thresholds.append(
+            np.asarray(jnp.log(uniform) - jnp.log1p(-uniform), dtype=np.float32)
+        )
+    if not thresholds:
+        return torch.zeros((0, 1, int(n_nodes), 1), dtype=torch.float32)
+    return torch.from_numpy(np.stack(thresholds, axis=0).copy()).reshape(
+        len(thresholds), 1, int(n_nodes), 1
+    )
+
+
 def stack_sample_history(history):
     if not history:
         return []

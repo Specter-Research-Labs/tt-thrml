@@ -66,6 +66,24 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     ),
 }
 
+_OPTIONAL_DEPENDENCY_HINTS = {
+    "jax": "Install `tt-thrml[runtime]` or `tt-thrml[jax]`.",
+    "torch": "Install `tt-thrml[runtime]` or `tt-thrml[torch]`.",
+    "ttnn": "Provide TTNN through the Tenstorrent runtime environment or container.",
+    "ttrt": "Provide TTRT / TT-MLIR runtime through the Tenstorrent runtime environment or container.",
+}
+
+
+def _raise_missing_optional_dependency(name: str, attr_name: str, exc: ModuleNotFoundError) -> None:
+    root_name = (name or "").split(".", 1)[0]
+    hint = _OPTIONAL_DEPENDENCY_HINTS.get(root_name)
+    if hint is None:
+        raise exc
+    raise ModuleNotFoundError(
+        f"`tt_thrml.{attr_name}` requires optional dependency `{root_name}`. "
+        f"{hint} TTNN and TT-MLIR tooling are environment-provided."
+    ) from exc
+
 
 def __getattr__(name: str):
     try:
@@ -76,12 +94,7 @@ def __getattr__(name: str):
     try:
         module = import_module(module_name, __name__)
     except ModuleNotFoundError as exc:
-        missing_module = exc.name or ""
-        if missing_module in {"jax", "torch"}:
-            raise AttributeError(
-                f"module {__name__!r} has no attribute {name!r}"
-            ) from exc
-        raise
+        _raise_missing_optional_dependency(exc.name or "", name, exc)
 
     value = getattr(module, attr_name)
     globals()[name] = value

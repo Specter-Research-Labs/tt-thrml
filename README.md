@@ -1,42 +1,70 @@
 # tt-thrml
 
-`tt-thrml` runs upstream [`thrml`](https://github.com/extropic-ai/thrml) programs on Tenstorrent hardware.
+`tt-thrml` is the Tenstorrent execution backend for upstream [`thrml`](https://github.com/extropic-ai/thrml).
 
-The split is simple:
+Upstream `thrml` owns model authoring, blocks, samplers, and schedules. `tt-thrml` owns:
+- program compilation into TT-shaped runtime metadata
+- device-resident state/runtime orchestration
+- TT-MLIR parameter-kernel execution
+- observation and sample materialization back to host
 
-- `thrml` defines the probabilistic program, blocks, factors, samplers, and schedule
-- `tt-thrml` executes that program on TT hardware
-- TT-MLIR is the main parameter-math path
-- TTNN handles device/runtime state, sampling orchestration, and writeback
+## Public Surface
 
-## How It Works
+The intended API is intentionally small:
 
-At a high level:
+- `tt_thrml.BackendBinding`
+- `tt_thrml.ExecutionOptions`
+- `tt_thrml.ParameterFamily`
+- `tt_thrml.ParameterKernelBackend`
+- `tt_thrml.TTMLIRConfig`
+- `tt_thrml.make_backend_binding`
+- `tt_thrml.make_ttmlir_backend_binding`
+- `tt_thrml.make_ttmlir_config`
+- `tt_thrml.make_ttmlir_parameter_kernel_backends`
+- `tt_thrml.make_ttmlir_parameter_kernel_ops`
+- `tt_thrml.open_device`
+- `tt_thrml.open_devices`
+- `tt_thrml.open_mesh_device`
+- `tt_thrml.close_devices`
+- `tt_thrml.close_mesh_device`
+- `tt_thrml.sample_states`
+- `tt_thrml.sample_states_many`
+- `tt_thrml.sample_with_observation`
+- `tt_thrml.sample_with_observation_many`
 
-1. upstream `thrml` builds a program and a sampling schedule
-2. `tt-thrml` compiles that into TT execution metadata
-3. canonical state lives on device
-4. for each sweep group, `tt-thrml` gathers the needed state, computes parameters, samples new block values, and writes them back
-5. parameter math goes through TT-MLIR; runtime orchestration stays in `tt-thrml`
+Everything else should be treated as compiler/runtime internals.
 
-A slightly more detailed internal note is in [docs/tt-thrml-internals.md](docs/tt-thrml-internals.md).
+## Execution Model
 
-## Supported Today
+`tt-thrml` compiles a THRML program into TT runtime metadata once, keeps canonical state on device, and executes the sweep with:
+- TTNN for state/orchestration/runtime plumbing
+- TT-MLIR for parameter-family math kernels
 
-The supported surface today is the THRML sampling path:
+The supported parameter families are:
+- spin
+- categorical
+- gaussian
 
-- spin / Ising programs
-- categorical discrete EBM programs
-- gaussian programs
-- mixed sampling programs built from those families
-- observation flows
+Mixed programs built from those families are supported too.
 
-The main thing that is still out of scope is the upstream training / moment-estimation side.
+The training / moment-estimation helpers from upstream notebooks are out of scope for this repo. Sampling and observation flows are the supported surface.
+
+## Install
+
+```bash
+pip install -e ".[runtime]"
+```
+
+Available extras:
+- `runtime`: installs JAX and Torch for the public API surface
+- `jax`: installs JAX only
+- `torch`: installs Torch only
+- `examples`: installs notebook/example-only Python dependencies
+- `testing`: installs the local pytest/coverage stack
+
+TTNN, TTRT, and TT-MLIR remain environment-provided dependencies. Use a Tenstorrent container or a local Tenstorrent toolchain build for those pieces.
 
 ## Quick Start
-
-Assume `program`, `init_state_free`, `state_clamp`, and `nodes_to_sample` come from normal
-upstream `thrml` authoring code.
 
 ```python
 import jax
@@ -73,22 +101,11 @@ finally:
 
 ## Fresh QuietBox
 
-On a fresh QuietBox (and assuming the tenstorrent toolchain is installed):
-
-1. create a Python environment
-2. `pip install -e .`
-3. if you want the notebook-style example ports too, use `pip install -e ".[examples]"`
-4. make sure the environment already has `ttrt.runtime` and a TT-MLIR toolchain
-5. set `TTMLIR_BUILD_DIR` and `SYSTEM_DESC_PATH`
-6. run one of the examples
-
-Example:
-
 ```bash
 python -m venv .venv
 source .venv/bin/activate
 pip install -U pip
-pip install -e ".[examples]"
+pip install -e ".[runtime,examples]"
 
 export TTMLIR_BUILD_DIR=/path/to/tt-mlir/build-py310-stablehlo
 export SYSTEM_DESC_PATH=/path/to/tt-mlir/ttrt-artifacts/system_desc.ttsys
@@ -102,26 +119,39 @@ python examples/tt_ising_chain_demo.py \
   --steps-per-sample 2
 ```
 
-If you use Tenstorrent's official container, install `tt-thrml` inside that container and point it
-at the matching TT-MLIR toolchain the same way.
+`tt-thrml` expects the TT runtime and TT-MLIR toolchain to be provided by the environment, typically through a Tenstorrent container/toolchain or a local `tt-mlir` build.
 
-## Examples
+## Device Ownership
 
-The repo includes both small TT demos and near-direct ports of the upstream THRML examples:
+- Caller-owned TTNN devices remain caller-owned.
+- Caller-owned `MeshDevice`s remain caller-owned.
+- Executors borrow devices; they do not close them.
+- The direct TT-MLIR bridge may temporarily wrap a live TTNN device, but it does not take ownership of it.
+- `tt-thrml` only closes TT runtime sessions that it opened itself.
 
-- [examples/tt_ising_chain_demo.py](examples/tt_ising_chain_demo.py)
-- [examples/tt_categorical_ebm_demo.py](examples/tt_categorical_ebm_demo.py)
-- [examples/tt_mixed_discrete_ebm_demo.py](examples/tt_mixed_discrete_ebm_demo.py)
-- [examples/tt_gaussian_chain_demo.py](examples/tt_gaussian_chain_demo.py)
-- [examples/tt_probabilistic_computing_demo.py](examples/tt_probabilistic_computing_demo.py)
-- [examples/tt_spin_models_sampling_demo.py](examples/tt_spin_models_sampling_demo.py)
-- [examples/tt_all_of_thrml_demo.py](examples/tt_all_of_thrml_demo.py)
+## RNG Contract
+
+Sampling randomness is prepared per block for the whole run interval, uploaded once, and consumed by iteration offset inside the sweep. The executor uses a stable `(iteration, block)` key mapping derived from the root JAX key, so seeded runs remain reproducible while avoiding tiny per-step random uploads in the hot loop.
 
 ## Multi-Device
 
-`tt-thrml` has a multi-device path through TT `MeshDevice`.
+`tt-thrml` supports:
+- many-job execution across multiple devices
+- single-process `MeshDevice` execution with replicated state and sweep-group synchronization
 
-Current scope:
+It does not implement a sharded multi-Wormhole single-program sweep engine.
 
-- single-process mesh execution
-- explicit TT mesh placement/composition
+## Examples
+
+- [`examples/tt_ising_chain_demo.py`](examples/tt_ising_chain_demo.py)
+- [`examples/tt_categorical_ebm_demo.py`](examples/tt_categorical_ebm_demo.py)
+- [`examples/tt_mixed_discrete_ebm_demo.py`](examples/tt_mixed_discrete_ebm_demo.py)
+- [`examples/tt_gaussian_chain_demo.py`](examples/tt_gaussian_chain_demo.py)
+- [`examples/tt_probabilistic_computing_demo.py`](examples/tt_probabilistic_computing_demo.py)
+- [`examples/tt_spin_models_sampling_demo.py`](examples/tt_spin_models_sampling_demo.py)
+- [`examples/tt_all_of_thrml_demo.py`](examples/tt_all_of_thrml_demo.py)
+- [`examples/tt_run_existing_program.py`](examples/tt_run_existing_program.py)
+
+## Internals
+
+See [`docs/tt-thrml-internals.md`](docs/tt-thrml-internals.md) for a compact architecture note and execution diagrams.

@@ -18,6 +18,7 @@ from ..compiler.categorical_ops import (
     dense_categorical_theta_op,
     exact_ttnn_categorical_sampler,
 )
+from ..compiler.device_contract import raise_host_fallback_disabled
 from ..compiler.gaussian_ops import (
     dense_gaussian_canonical_op,
 )
@@ -34,6 +35,7 @@ from .compiled_program import (
     CompiledDirectSourcePlan,
     CompiledGatherSourcePlan,
     CompiledInteraction,
+    CompiledInteractionGroup,
     CompiledProgram,
 )
 from .family_handlers import (
@@ -61,6 +63,16 @@ def _emit_progress(progress, message: str) -> None:
     progress(message)
 
 
+def _sample_keys_for_iteration_keys(iteration_keys: Sequence[object], *, n_blocks: int):
+    return tuple(
+        tuple(
+            jax.random.split(block_key, 2)[0]
+            for block_key in jax.random.split(iter_key, n_blocks)
+        )
+        for iter_key in iteration_keys
+    )
+
+
 def _ensure_index_tensor_dtype(ttnn, device, value, *, dtype):
     current_dtype = getattr(value, "dtype", None)
     if current_dtype == dtype:
@@ -77,18 +89,12 @@ def _ensure_index_tensor_dtype(ttnn, device, value, *, dtype):
     current_dtype = getattr(value, "dtype", None)
     if current_dtype == dtype:
         return value
-
-    layout = getattr(value, "layout", None)
-    host_value = (
-        canonical_replica_to_torch(ttnn, device, value)
-        if is_multi_device_mesh(device)
-        else ttnn.to_torch(value)
-    )
-    return ttnn.from_torch(
-        host_value.contiguous(),
-        dtype=dtype,
-        layout=layout,
-        device=device,
+    raise_host_fallback_disabled(
+        "index tensor dtype coercion",
+        remedy=(
+            "Use a TT backend that can cast gather indices on-device, or "
+            "compile index tensors directly in the required dtype."
+        ),
     )
 
 
@@ -281,22 +287,16 @@ class TTProgramExecutor:
             )
 
         n_blocks = len(self.program.gibbs_spec.free_blocks)
-        sample_keys = tuple(
-            tuple(
-                jax.random.split(block_key, 2)[0]
-                for block_key in jax.random.split(iter_key, n_blocks)
-            )
-            for iter_key in iteration_keys
-        )
+        sample_keys = _sample_keys_for_iteration_keys(iteration_keys, n_blocks=n_blocks)
 
-        prepared_randoms_by_block: dict[int, tuple[object, ...]] = {}
+        prepared_randoms_by_block: dict[int, object] = {}
 
         for block in self.compiled.blocks:
             handler = self._parameter_family_handler(block)
             block_sample_keys = tuple(
                 sample_keys[iter_index][block.block_index] for iter_index in range(n_iters)
             )
-            prepared_randoms_by_block[block.block_index] = handler.prepare_sample_inputs(
+            prepared_randoms_by_block[block.block_index] = handler.prepare_batch_sample_inputs(
                 self,
                 block,
                 block_sample_keys,
@@ -428,15 +428,15 @@ class TTProgramExecutor:
         if gathered_state is None:
             raise RuntimeError("Compiled interaction source plan produced no state.")
 
-        target_shape = (batch_size, *source_plan.target_shape_tail)
+        target_shape = source_plan.tensor_spec.shape(batch_size)
         reshaped_source = (
             gathered_state
             if tuple(gathered_state.shape) == target_shape
             else self.ttnn.reshape(gathered_state, target_shape)
         )
-        if source_plan.output_layout is not None:
+        if source_plan.tensor_spec.layout is not None:
             return _state_runtime.maybe_to_layout(
-                self, reshaped_source, source_plan.output_layout
+                self, reshaped_source, source_plan.tensor_spec.layout
             )
         return reshaped_source
 
@@ -483,20 +483,27 @@ class TTProgramExecutor:
                 batch_size,
             )
             for interaction in block.interactions:
-                spin_sources, categorical_sources, continuous_sources = (
-                    self._gather_interaction_sources(
+                if isinstance(interaction, CompiledInteractionGroup):
+                    partial = handler.compute_interaction_group_partial(
+                        self,
                         block,
                         interaction,
                     )
-                )
-                partial = handler.compute_interaction_partial(
-                    self,
-                    block,
-                    interaction,
-                    spin_sources,
-                    categorical_sources,
-                    continuous_sources,
-                )
+                else:
+                    spin_sources, categorical_sources, continuous_sources = (
+                        self._gather_interaction_sources(
+                            block,
+                            interaction,
+                        )
+                    )
+                    partial = handler.compute_interaction_partial(
+                        self,
+                        block,
+                        interaction,
+                        spin_sources,
+                        categorical_sources,
+                        continuous_sources,
+                    )
                 parameters = self.ttnn.add(parameters, partial)
             return self._transform_sampler_parameters(
                 block=block,
@@ -673,16 +680,32 @@ class TTProgramExecutor:
     ) -> None:
         def _run():
             self._require_state()
+            resolved_prepared_randoms = prepared_randoms_by_block
             block_sample_keys = (
                 tuple(sample_keys)
                 if sample_keys is not None
                 else tuple(
-                    jax.random.split(block_key, 2)[0]
-                    for block_key in jax.random.split(
-                        key, len(self.program.gibbs_spec.free_blocks)
-                    )
+                    _sample_keys_for_iteration_keys(
+                        (key,),
+                        n_blocks=len(self.program.gibbs_spec.free_blocks),
+                    )[0]
                 )
             )
+            if resolved_prepared_randoms is None:
+                resolved_prepared_randoms = {}
+                for block in self.compiled.blocks:
+                    handler = self._parameter_family_handler(block)
+                    prepared_random = handler.prepare_batch_sample_inputs(
+                        self,
+                        block,
+                        (block_sample_keys[block.block_index],),
+                    )
+                    resolved_prepared_randoms[block.block_index] = handler.select_prepared_random(
+                        self,
+                        block,
+                        prepared_random,
+                        0,
+                    )
             for group_index, sampling_group in enumerate(
                 self.program.gibbs_spec.sampling_order
             ):
@@ -698,9 +721,7 @@ class TTProgramExecutor:
                                 self, block_index
                             ),
                             prepared_random=(
-                                None
-                                if prepared_randoms_by_block is None
-                                else prepared_randoms_by_block.get(block_index)
+                                resolved_prepared_randoms.get(block_index)
                             ),
                         ),
                     )
@@ -732,8 +753,15 @@ class TTProgramExecutor:
                 iter_key,
                 sample_keys=prepared_randoms.sample_keys[iter_index],
                 prepared_randoms_by_block={
-                    block_index: tensors[iter_index]
-                    for block_index, tensors in prepared_randoms.prepared_randoms_by_block.items()
+                    block_index: self._parameter_family_handler(
+                        self.compiled.blocks[block_index]
+                    ).select_prepared_random(
+                        self,
+                        self.compiled.blocks[block_index],
+                        prepared_random,
+                        iter_index,
+                    )
+                    for block_index, prepared_random in prepared_randoms.prepared_randoms_by_block.items()
                 },
             )
 
@@ -759,23 +787,18 @@ class TTProgramExecutor:
         def _run():
             self._require_state()
             if not all(
-                block.sampler_lowering.parameter_family == SPIN_PARAMETER_FAMILY
-                and block.sampler_lowering.sampler_state_spec is None
+                block.sampler_lowering.sampler_state_spec is None
+                and self._parameter_family_handler(block).supports_batch_sampling
                 for block in self.compiled.blocks
             ):
                 raise TypeError(
-                    "run_sweep_batch() currently supports only all-spin stateless programs."
+                    "run_sweep_batch() requires stateless blocks with explicit batched sampling support."
                 )
 
             n_free_blocks = len(self.program.gibbs_spec.free_blocks)
+            sample_keys = _sample_keys_for_iteration_keys(iteration_keys, n_blocks=n_free_blocks)
             block_sample_keys = tuple(
-                tuple(
-                    jax.random.split(
-                        jax.random.split(iter_key, n_free_blocks)[block_index],
-                        2,
-                    )[0]
-                    for iter_key in iteration_keys
-                )
+                tuple(sample_keys[iter_index][block_index] for iter_index in range(len(sample_keys)))
                 for block_index in range(n_free_blocks)
             )
             for group_index, sampling_group in enumerate(
@@ -832,8 +855,15 @@ class TTProgramExecutor:
                 iter_key,
                 sample_keys=iteration_sample_keys,
                 prepared_randoms_by_block={
-                    block_index: tensors[iter_index]
-                    for block_index, tensors in prepared_randoms.prepared_randoms_by_block.items()
+                    block_index: self._parameter_family_handler(
+                        self.compiled.blocks[block_index]
+                    ).select_prepared_random(
+                        self,
+                        self.compiled.blocks[block_index],
+                        prepared_random,
+                        iter_index,
+                    )
+                    for block_index, prepared_random in prepared_randoms.prepared_randoms_by_block.items()
                 },
             )
 

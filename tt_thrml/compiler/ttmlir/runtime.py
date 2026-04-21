@@ -15,6 +15,8 @@ import threading
 import time
 from typing import TYPE_CHECKING
 
+from ..device_contract import raise_host_fallback_disabled
+
 if TYPE_CHECKING:
     import torch
 
@@ -419,7 +421,10 @@ def _is_torch_tensor(value) -> bool:
         torch = _import_torch()
     except ModuleNotFoundError:
         return False
-    return isinstance(value, torch.Tensor)
+    tensor_type = getattr(torch, "Tensor", None)
+    if tensor_type is None or tensor_type is object:
+        return False
+    return isinstance(value, tensor_type)
 
 
 def _resolve_runtime_utils_module(tt_runtime):
@@ -463,6 +468,23 @@ def supports_direct_ttnn_inputs(*, device=None) -> bool:
         runtime_utils is not None
         and callable(getattr(runtime_utils, "create_runtime_device_from_ttnn", None))
         and _supports_direct_device_inputs(runtime_utils)
+    )
+
+
+def supports_direct_ttnn_outputs(*, device=None) -> bool:
+    if device is None:
+        return False
+
+    try:
+        tt_runtime = _import_ttrt_runtime()
+    except RuntimeError:
+        return False
+
+    runtime_utils = _resolve_runtime_utils_module(tt_runtime)
+    return (
+        runtime_utils is not None
+        and callable(getattr(runtime_utils, "create_runtime_device_from_ttnn", None))
+        and _supports_direct_device_outputs(runtime_utils)
     )
 
 
@@ -550,12 +572,9 @@ def restore_output_tensor(
     output_layout,
 ):
     if _is_torch_tensor(output):
-        torch = _import_torch()
-        return ttnn.from_torch(
-            output.to(torch.float32).contiguous(),
-            dtype=output_dtype,
-            layout=output_layout,
-            device=device,
+        raise_host_fallback_disabled(
+            "TT-MLIR output restoration",
+            remedy="Use a runtime with direct TTNN output bridge support.",
         )
 
     restored = output
@@ -749,77 +768,49 @@ def run_flatbuffer(
     logger = Logger()
     file_manager = FileManager(logger)
     binary = Binary(logger, file_manager, str(flatbuffer_path))
-    program = binary.get_program(0)
     with _compatible_device_runtime(tt_runtime, binary.fbb) as device_runtime:
-        if _supports_existing_ttnn_device_bridge(tt_runtime, device):
-            runtime_utils = _resolve_runtime_utils_module(tt_runtime)
-            if runtime_utils is None:
-                raise RuntimeError(
-                    "TT-MLIR runtime bridge unexpectedly missing after support check."
-                )
-
-            runtime_device = runtime_utils.create_runtime_device_from_ttnn(device)
-            runtime_inputs = []
-            try:
-                for input_index, tensor in enumerate(input_tensors):
-                    runtime_inputs.append(
-                        _prepare_runtime_input_for_device_execution(
-                            tt_runtime,
-                            runtime_utils=runtime_utils,
-                            executable=binary.fbb,
-                            runtime_device=runtime_device,
-                            input_index=input_index,
-                            tensor=tensor,
-                        )
-                    )
-
-                runtime_outputs = tt_runtime.submit(
-                    runtime_device, binary.fbb, 0, runtime_inputs
-                )
-                if prefer_device_output and _supports_direct_device_outputs(runtime_utils):
-                    outputs, runtime_output_dtypes = _runtime_outputs_to_device_tensors(
-                        tt_runtime, runtime_utils, runtime_outputs
-                    )
-                else:
-                    outputs, runtime_output_dtypes = _runtime_outputs_to_torch(
-                        tt_runtime, runtime_outputs
-                    )
-            finally:
-                for runtime_input in runtime_inputs:
-                    tt_runtime.deallocate_tensor(runtime_input, force=True)
-
-            return TTMLIRExecutionResult(
-                outputs=outputs,
-                runtime_output_dtypes=runtime_output_dtypes,
+        if not _supports_existing_ttnn_device_bridge(tt_runtime, device):
+            raise_host_fallback_disabled(
+                "TT-MLIR runtime device bridge",
+                remedy="Use a runtime that exposes direct TTNN bridge helpers.",
+            )
+        runtime_utils = _resolve_runtime_utils_module(tt_runtime)
+        if runtime_utils is None:
+            raise RuntimeError(
+                "TT-MLIR runtime bridge unexpectedly missing after support check."
+            )
+        if not _supports_direct_device_outputs(runtime_utils):
+            raise_host_fallback_disabled(
+                "TT-MLIR runtime output bridge",
+                remedy="Use a runtime that exposes direct TTNN output bridge helpers.",
             )
 
-        runtime_device_ids = _resolve_runtime_device_ids(device)
-        with borrow_runtime_session(
-            config,
-            mesh_shape=program.mesh_shape,
-            device_ids=runtime_device_ids,
-            device_runtime=device_runtime,
-        ) as session:
-            tt_runtime = session.tt_runtime
-            device = session.device
-            runtime_inputs = []
-            try:
-                for input_index, tensor in enumerate(input_tensors):
-                    host_tensor = _create_runtime_input(tt_runtime, tensor)
-                    layout = tt_runtime.get_layout(binary.fbb, 0, input_index)
-                    runtime_inputs.append(
-                        tt_runtime.to_layout(host_tensor, device, layout, True)
+        runtime_device = runtime_utils.create_runtime_device_from_ttnn(device)
+        runtime_inputs = []
+        try:
+            for input_index, tensor in enumerate(input_tensors):
+                runtime_inputs.append(
+                    _prepare_runtime_input_for_device_execution(
+                        tt_runtime,
+                        runtime_utils=runtime_utils,
+                        executable=binary.fbb,
+                        runtime_device=runtime_device,
+                        input_index=input_index,
+                        tensor=tensor,
                     )
-
-                runtime_outputs = tt_runtime.submit(device, binary.fbb, 0, runtime_inputs)
-                outputs, runtime_output_dtypes = _runtime_outputs_to_torch(
-                    tt_runtime, runtime_outputs
                 )
-            finally:
-                for runtime_input in runtime_inputs:
-                    tt_runtime.deallocate_tensor(runtime_input, force=True)
 
-        return TTMLIRExecutionResult(
-            outputs=tuple(outputs),
-            runtime_output_dtypes=tuple(runtime_output_dtypes),
-        )
+            runtime_outputs = tt_runtime.submit(
+                runtime_device, binary.fbb, 0, runtime_inputs
+            )
+            outputs, runtime_output_dtypes = _runtime_outputs_to_device_tensors(
+                tt_runtime, runtime_utils, runtime_outputs
+            )
+        finally:
+            for runtime_input in runtime_inputs:
+                tt_runtime.deallocate_tensor(runtime_input, force=True)
+
+    return TTMLIRExecutionResult(
+        outputs=outputs,
+        runtime_output_dtypes=runtime_output_dtypes,
+    )

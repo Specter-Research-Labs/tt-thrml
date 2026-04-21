@@ -5,6 +5,8 @@ import types
 
 import pytest
 
+from tt_thrml.compiler.device_contract import HostFallbackError
+from tt_thrml.compiler.ttmlir.tensor_bridge import execute_single_output_flatbuffer
 from tt_thrml.compiler.ttmlir import runtime as ttmlir_runtime
 from tt_thrml.compiler.ttmlir.runtime import make_ttmlir_config
 
@@ -92,6 +94,90 @@ def test_make_ttmlir_config_rejects_build_dir_and_explicit_tools(tmp_path: Path)
         )
 
 
+def test_execute_single_output_flatbuffer_rejects_host_output_fallback_by_default(tmp_path):
+    config = ttmlir_runtime.TTMLIRConfig(
+        system_desc_path=tmp_path / "system_desc.ttsys",
+        artifact_root=tmp_path / "artifacts",
+    )
+
+    class _FakeTTNN:
+        bfloat16 = "bf16"
+        TILE_LAYOUT = "tile"
+
+    class _FakeOutput:
+        shape = (1, 1, 1, 1)
+        dtype = "bf16"
+        layout = "tile"
+
+    with pytest.raises(HostFallbackError, match="output restoration"):
+        execute_single_output_flatbuffer(
+            config=config,
+            ttnn=_FakeTTNN(),
+            device="fake:0",
+            flatbuffer_path=tmp_path / "kernel.ttnn",
+            input_tensors=["input"],
+            direct_input_tensors=["input"],
+            output_reference=_FakeOutput(),
+            op_name="test-op",
+            run_flatbuffer_fn=lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("run_flatbuffer should not be called")
+            ),
+            supports_direct_ttnn_inputs_fn=lambda **kwargs: True,
+            supports_direct_ttnn_outputs_fn=lambda **kwargs: False,
+        )
+
+
+def test_execute_single_output_flatbuffer_skips_host_input_factory_when_direct_bridge_exists(
+    tmp_path,
+):
+    config = ttmlir_runtime.TTMLIRConfig(
+        system_desc_path=tmp_path / "system_desc.ttsys",
+        artifact_root=tmp_path / "artifacts",
+    )
+
+    class _FakeTTNN:
+        bfloat16 = "bf16"
+        TILE_LAYOUT = "tile"
+
+    class _FakeOutput:
+        shape = (1, 1, 1, 1)
+        dtype = "bf16"
+        layout = "tile"
+
+    class _FakeDeviceOutput:
+        layout = "tile"
+        dtype = "bf16"
+
+    direct_inputs = ["device-input"]
+    seen = {}
+
+    def fake_run(*args, **kwargs):
+        seen["inputs"] = kwargs["input_tensors"]
+        return ttmlir_runtime.TTMLIRExecutionResult(
+            outputs=(_FakeDeviceOutput(),),
+            runtime_output_dtypes=("float32",),
+        )
+
+    result = execute_single_output_flatbuffer(
+        config=config,
+        ttnn=_FakeTTNN(),
+        device="fake:0",
+        flatbuffer_path=tmp_path / "kernel.ttnn",
+        direct_input_tensors=direct_inputs,
+        input_tensors_factory=lambda: (_ for _ in ()).throw(
+            AssertionError("host input factory should not be used")
+        ),
+        output_reference=_FakeOutput(),
+        op_name="test-op",
+        run_flatbuffer_fn=fake_run,
+        supports_direct_ttnn_inputs_fn=lambda **kwargs: True,
+        supports_direct_ttnn_outputs_fn=lambda **kwargs: True,
+    )
+
+    assert seen["inputs"] == direct_inputs
+    assert isinstance(result, _FakeDeviceOutput)
+
+
 def test_borrow_runtime_session_separates_cache_by_device_runtime(monkeypatch, tmp_path):
     class FakeTTModule:
         class MeshDeviceOptions:
@@ -167,7 +253,7 @@ def test_borrow_runtime_session_separates_cache_by_device_runtime(monkeypatch, t
     ttmlir_runtime._RUNTIME_SESSION_CACHE.clear()
 
 
-def test_run_flatbuffer_uses_compatible_runtime(monkeypatch, tmp_path):
+def test_run_flatbuffer_rejects_missing_direct_ttnn_bridge(monkeypatch, tmp_path):
     class FakeShard:
         def __init__(self, name):
             self.name = name
@@ -228,39 +314,12 @@ def test_run_flatbuffer_uses_compatible_runtime(monkeypatch, tmp_path):
 
     fake_tt_runtime = FakeTTModule()
 
-    captured = {}
-
-    class FakeDevice:
-        def id(self):
-            return 7
-
-    @contextmanager
-    def fake_borrow_runtime_session(config, *, mesh_shape, device_ids=None, device_runtime=None):
-        captured["config"] = config
-        captured["mesh_shape"] = mesh_shape
-        captured["device_ids"] = device_ids
-        captured["device_runtime"] = device_runtime
-        yield types.SimpleNamespace(tt_runtime=fake_tt_runtime, device="fake-device")
-
     monkeypatch.setattr(
         ttmlir_runtime,
         "borrow_runtime_session",
-        fake_borrow_runtime_session,
-    )
-    monkeypatch.setattr(
-        ttmlir_runtime,
-        "_create_runtime_input",
-        lambda tt_runtime, tensor: f"host:{tensor}",
-    )
-    monkeypatch.setattr(
-        ttmlir_runtime,
-        "_is_torch_tensor",
-        lambda tensor: True,
-    )
-    monkeypatch.setattr(
-        ttmlir_runtime,
-        "_runtime_tensor_to_torch",
-        lambda tt_runtime, runtime_tensor: f"converted:{runtime_tensor}",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("borrow_runtime_session should not be used")
+        ),
     )
     monkeypatch.setattr(ttmlir_runtime, "_import_ttrt_runtime", lambda: fake_tt_runtime)
     monkeypatch.setattr(
@@ -273,22 +332,15 @@ def test_run_flatbuffer_uses_compatible_runtime(monkeypatch, tmp_path):
         system_desc_path=tmp_path / "system_desc.ttsys",
         artifact_root=tmp_path / "artifacts",
     )
-    result = ttmlir_runtime.run_flatbuffer(
-        config,
-        flatbuffer_path=tmp_path / "kernel.ttnn",
-        input_tensors=["input-a", "input-b"],
-        device=FakeDevice(),
-    )
+    with pytest.raises(HostFallbackError, match="runtime device bridge"):
+        ttmlir_runtime.run_flatbuffer(
+            config,
+            flatbuffer_path=tmp_path / "kernel.ttnn",
+            input_tensors=["input-a", "input-b"],
+            device=types.SimpleNamespace(id=lambda: 7),
+        )
 
     assert fake_tt_runtime.compatible_binary == "fake-flatbuffer"
-    assert captured == {
-        "config": config,
-        "mesh_shape": (1, 1),
-        "device_ids": (7,),
-        "device_runtime": "compatible-runtime",
-    }
-    assert result.outputs == ("converted:shard-0",)
-    assert result.runtime_output_dtypes == ("float32",)
     assert fake_tt_runtime.current_device_runtime == "unset"
 
 
@@ -340,7 +392,7 @@ def test_run_flatbuffer_reuses_existing_ttnn_device_when_bridge_available(
 
         def submit(self, device, fbb, program_index, runtime_inputs):
             self.runtime_tensor_inputs.append(tuple(runtime_inputs))
-            return ["runtime-output"]
+            return [types.SimpleNamespace(get_dtype=lambda: "float32", name="runtime-output")]
 
         def to_host(self, runtime_output, untilize=True):
             return [FakeShard()]
@@ -372,16 +424,7 @@ def test_run_flatbuffer_reuses_existing_ttnn_device_when_bridge_available(
         "_create_runtime_input",
         lambda tt_runtime, tensor: f"host:{tensor}",
     )
-    monkeypatch.setattr(
-        ttmlir_runtime,
-        "_is_torch_tensor",
-        lambda tensor: True,
-    )
-    monkeypatch.setattr(
-        ttmlir_runtime,
-        "_runtime_tensor_to_torch",
-        lambda tt_runtime, runtime_tensor: f"converted:{runtime_tensor}",
-    )
+    monkeypatch.setattr(ttmlir_runtime, "_is_torch_tensor", lambda tensor: True)
     monkeypatch.setattr(ttmlir_runtime, "_import_ttrt_runtime", lambda: fake_tt_runtime)
     monkeypatch.setattr(
         ttmlir_runtime,
@@ -414,7 +457,8 @@ def test_run_flatbuffer_reuses_existing_ttnn_device_when_bridge_available(
             ("host:input-b", "runtime-device", "layout-1", True),
         )
     ]
-    assert result.outputs == ("converted:fake-shard",)
+    assert len(result.outputs) == 1
+    assert str(result.outputs[0]).startswith("device:")
     assert result.runtime_output_dtypes == ("float32",)
 
 
@@ -427,13 +471,6 @@ def test_run_flatbuffer_uses_direct_ttnn_tensor_bridge_when_available(
 
         def __repr__(self):
             return self.name
-
-    class FakeShard:
-        def __repr__(self):
-            return "fake-shard"
-
-        def get_dtype(self):
-            return "float32"
 
     class FakeTTModule:
         class DataType:
@@ -465,6 +502,9 @@ def test_run_flatbuffer_uses_direct_ttnn_tensor_bridge_when_available(
             self.direct_input_tensors.append((tensor, borrow))
             return f"device-input:{tensor}"
 
+        def get_ttnn_tensor_from_runtime_tensor(self, runtime_tensor):
+            return f"device:{runtime_tensor}"
+
         def get_layout(self, fbb, program_index, input_index):
             self.layouts.append((fbb, program_index, input_index))
             return f"layout-{input_index}"
@@ -474,10 +514,7 @@ def test_run_flatbuffer_uses_direct_ttnn_tensor_bridge_when_available(
 
         def submit(self, device, fbb, program_index, runtime_inputs):
             self.runtime_tensor_inputs.append(tuple(runtime_inputs))
-            return ["runtime-output"]
-
-        def to_host(self, runtime_output, untilize=True):
-            return [FakeShard()]
+            return [types.SimpleNamespace(get_dtype=lambda: "float32", name="runtime-output")]
 
         def deallocate_tensor(self, runtime_tensor, force=True):
             return None
@@ -503,16 +540,7 @@ def test_run_flatbuffer_uses_direct_ttnn_tensor_bridge_when_available(
         "borrow_runtime_session",
         fail_borrow_runtime_session,
     )
-    monkeypatch.setattr(
-        ttmlir_runtime,
-        "_is_torch_tensor",
-        lambda tensor: False,
-    )
-    monkeypatch.setattr(
-        ttmlir_runtime,
-        "_runtime_tensor_to_torch",
-        lambda tt_runtime, runtime_tensor: f"converted:{runtime_tensor}",
-    )
+    monkeypatch.setattr(ttmlir_runtime, "_is_torch_tensor", lambda tensor: False)
     monkeypatch.setattr(ttmlir_runtime, "_import_ttrt_runtime", lambda: fake_tt_runtime)
     monkeypatch.setattr(
         ttmlir_runtime,
@@ -549,7 +577,8 @@ def test_run_flatbuffer_uses_direct_ttnn_tensor_bridge_when_available(
             ("device-input:input-b", "runtime-device", "layout-1", True),
         )
     ]
-    assert result.outputs == ("converted:fake-shard",)
+    assert len(result.outputs) == 1
+    assert str(result.outputs[0]).startswith("device:")
     assert result.runtime_output_dtypes == ("float32",)
 
 

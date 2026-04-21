@@ -8,6 +8,8 @@ from jax import numpy as jnp
 import numpy as np
 import torch
 
+from .device_contract import raise_host_fallback_disabled
+from ..tensor_specs import _first_available_attr
 from .ttnn_kernels import select_last_dim_expected
 
 
@@ -24,15 +26,12 @@ class GaussianCanonicalInputs:
 def dense_gaussian_canonical_op(*, ttnn, device, inputs: GaussianCanonicalInputs):
     selected = inputs.flat_weights
     if inputs.flat_index is not None:
-        selected_host = select_last_dim_expected(
-            ttnn.to_torch(inputs.flat_weights),
-            ttnn.to_torch(inputs.flat_index).to(torch.int64),
-        )
-        selected = ttnn.from_torch(
-            selected_host,
-            dtype=getattr(inputs.flat_weights, "dtype", None),
-            layout=getattr(inputs.flat_weights, "layout", None),
-            device=device,
+        raise_host_fallback_disabled(
+            "native gaussian tail selection",
+            remedy=(
+                "Use the TT-MLIR parameter-kernel backend for gaussian blocks with "
+                "indexed categorical tails."
+            ),
         )
 
     weighted = (
@@ -49,7 +48,7 @@ def dense_gaussian_canonical_op(*, ttnn, device, inputs: GaussianCanonicalInputs
     zeros = ttnn.full(
         [int(partial.shape[0]), 1, inputs.n_nodes, 1],
         fill_value=0.0,
-        dtype=getattr(partial, "dtype", getattr(ttnn, "bfloat16")),
+        dtype=getattr(partial, "dtype", _first_available_attr(ttnn, "bfloat16")),
         layout=getattr(inputs.flat_weights, "layout", None),
         device=device,
     )
@@ -69,6 +68,17 @@ def gaussian_noise_tensor(key, *, n_nodes: int) -> torch.Tensor:
         dtype=np.float32,
     )
     return torch.from_numpy(noise.copy()).reshape(1, 1, n_nodes, 1)
+
+
+def gaussian_noise_batch_tensor(keys, *, n_nodes: int) -> torch.Tensor:
+    noise = np.asarray(
+        [
+            jax.random.normal(key, shape=(n_nodes,), dtype=jnp.float32)
+            for key in keys
+        ],
+        dtype=np.float32,
+    )
+    return torch.from_numpy(noise.copy()).reshape(len(keys), 1, n_nodes, 1)
 
 
 def gather_gaussian_tail_weights_jax(

@@ -113,8 +113,8 @@ class CompiledInteraction:
 class CompiledInteractionGroup:
     interactions: tuple[CompiledInteraction, ...]
     n_interactions: int
-    flat_weights: object | None
-    active_mask: object | None
+    flat_weights: object
+    active_mask: object
     flat_indices: object | None = None
     parameter_spec: PhysicalTensorSpec | None = None
     flat_weights_spec: PhysicalTensorSpec | None = None
@@ -153,6 +153,13 @@ CompiledFamilyRuntime = (
 
 
 @dataclass(frozen=True)
+class CompiledBlockParameterPayload:
+    """Runtime-ready grouped parameter payload for one Gibbs block."""
+
+    groups: tuple[CompiledInteractionGroup, ...]
+
+
+@dataclass(frozen=True)
 class CompiledBlock:
     block_index: int
     sampler_lowering: CompiledSamplerLowering
@@ -161,8 +168,12 @@ class CompiledBlock:
     output_dtype: object
     n_categories: int | None
     state_view: CompiledStateView
-    interactions: tuple[CompiledInteraction | CompiledInteractionGroup, ...]
+    parameter_payload: CompiledBlockParameterPayload
     family_runtime: CompiledFamilyRuntime
+
+    @property
+    def interactions(self) -> tuple[CompiledInteractionGroup, ...]:
+        return self.parameter_payload.groups
 
 
 @dataclass(frozen=True)
@@ -180,6 +191,7 @@ class CompiledProgram:
 
 __all__ = [
     "CompiledBlock",
+    "CompiledBlockParameterPayload",
     "CompiledCategoricalFamilyRuntime",
     "CompiledDirectSourcePlan",
     "CompiledGatherShard",

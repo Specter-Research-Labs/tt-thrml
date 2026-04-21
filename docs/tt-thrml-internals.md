@@ -32,26 +32,29 @@ flowchart TD
     A["run_sweep(...)"] --> B["prepare block random buffers"]
     B --> C["for sampling group"]
     C --> D["for block"]
-    D --> E["gather interaction sources from device state"]
-    E --> F["compute_block_parameters(...)"]
-    F --> G["sample block"]
-    G --> H["stage pending block update"]
-    H --> I["write group updates to canonical device state"]
-    I --> J{"more groups?"}
-    J -->|yes| C
-    J -->|no| K["observe / materialize outputs"]
+    D --> E["family compute_block_parameters(...)"]
+    E --> F["gather group sources from device state"]
+    F --> G["launch grouped TT parameter kernels"]
+    G --> H["sample block"]
+    H --> I["stage pending block update"]
+    I --> J["write group updates to canonical device state"]
+    J --> K{"more groups?"}
+    K -->|yes| C
+    K -->|no| L["observe / materialize outputs"]
 ```
 
 ## Parameter-Kernel Boundary
 
 The parameter-kernel layer is the main TT-MLIR boundary.
 
-- The compiler emits per-block runtime metadata and physical tensor specs.
-- The executor builds one block payload from grouped interactions.
-- The family handler launches one block parameter op.
+- The compiler emits a `CompiledBlockParameterPayload` for every block.
+- Every dynamic term is represented as a `CompiledInteractionGroup`, including singleton terms.
+- The executor delegates parameter computation to the block family runtime in one call.
+- The family runtime owns grouped source gathering and parameter-input assembly.
+- Current kernels launch once per compatible group bucket.
 - The TT-MLIR bridge uses cached metadata/signatures and direct TTNN runtime bridging as the default contract.
 
-The executor still owns schedule iteration, state writes, and observation.
+The executor still owns schedule iteration, state writes, and observation; it does not own parameter-family tensor assembly.
 
 ## Device Ownership
 

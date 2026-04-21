@@ -5,6 +5,7 @@ import hashlib
 import json
 import math
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Sequence
 
 import jax
@@ -41,6 +42,18 @@ from .tensor_bridge import (
     ttnn_input_as_torch,
 )
 from ..ttnn_kernels import categorical_theta_dense_expected
+
+
+def _categorical_theta_output_reference(ttnn, inputs: CategoricalThetaInputs):
+    return SimpleNamespace(
+        layout=getattr(
+            inputs.flat_weights,
+            "layout",
+            getattr(ttnn, "ROW_MAJOR_LAYOUT", getattr(ttnn, "TILE_LAYOUT", None)),
+        ),
+        # TT-MLIR categorical kernels currently materialize float32 outputs.
+        dtype=getattr(ttnn, "float32", torch.float32),
+    )
 
 @dataclass(frozen=True)
 class TTMLIRCategoricalThetaOpSignature:
@@ -168,7 +181,7 @@ class TTMLIRCategoricalThetaOp:
             flatbuffer_path=artifact.flatbuffer_path,
             input_tensors_factory=lambda: _runtime_host_inputs(ttnn, inputs),
             direct_input_tensors=direct_runtime_inputs,
-            output_reference=inputs.flat_weights,
+            output_reference=_categorical_theta_output_reference(ttnn, inputs),
             op_name="categorical-theta op",
             run_flatbuffer_fn=run_flatbuffer,
             supports_direct_ttnn_inputs_fn=supports_direct_ttnn_inputs,

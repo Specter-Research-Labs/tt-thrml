@@ -1,3 +1,5 @@
+from dataclasses import dataclass
+
 import pytest
 from thrml.block_management import Block
 from thrml.block_sampling import BlockGibbsSpec
@@ -23,6 +25,19 @@ from tt_thrml.runtime_config import (
     parameter_family_spec,
     require_backend,
 )
+
+
+class _FakeTTNN:
+    __name__ = "ttnn"
+    __version__ = "1.2.3"
+    __file__ = "/tmp/fake_ttnn.py"
+
+
+class _FakeDevice:
+    def __init__(self, device_id: int):
+        self.device_id = device_id
+        self.arch = "wormhole_b0"
+        self.name = f"fake:{device_id}"
 
 
 def test_make_backend_binding_normalizes_devices_and_primary_device():
@@ -67,8 +82,8 @@ def test_backend_binding_parameter_kernel_overlay_merges_families():
 
 
 def test_backend_binding_cache_key_helpers_reuse_normalized_parameter_cache_key():
-    ttnn = object()
-    devices = [object(), object()]
+    ttnn = _FakeTTNN()
+    devices = [_FakeDevice(0), _FakeDevice(1)]
     spin_op = object()
     theta_op = object()
     binding = make_backend_binding(
@@ -109,25 +124,24 @@ def test_backend_binding_cache_key_helpers_reuse_normalized_parameter_cache_key(
             backend_object_fingerprint(spin_op),
         ),
     )
+    expected_ttnn_key = binding.semantic_ttnn_key
+    expected_device_keys = binding.device_key
 
     assert binding.cache_key == reordered.cache_key
     assert binding.cache_key == (
-        backend_object_fingerprint(ttnn),
-        (
-            backend_object_fingerprint(devices[0]),
-            backend_object_fingerprint(devices[1]),
-        ),
+        expected_ttnn_key,
+        expected_device_keys,
         expected_parameter_kernel_backend_key,
         expected_parameter_kernel_cache_key,
     )
     assert binding.device_cache_key(devices[1]) == (
-        backend_object_fingerprint(ttnn),
-        backend_object_fingerprint(devices[1]),
+        expected_ttnn_key,
+        expected_device_keys[1],
         expected_parameter_kernel_backend_key,
     )
     assert binding.executor_cache_key(devices[0]) == (
-        backend_object_fingerprint(ttnn),
-        backend_object_fingerprint(devices[0]),
+        expected_ttnn_key,
+        expected_device_keys[0],
         expected_parameter_kernel_backend_key,
         expected_parameter_kernel_cache_key,
     )
@@ -219,6 +233,19 @@ def test_fingerprint_accepts_node_types_and_programs_with_node_type_metadata():
 
     assert stable_fingerprint(CategoricalNode) == stable_fingerprint(CategoricalNode)
     assert isinstance(program_fingerprint(program), str)
+
+
+def test_backend_object_fingerprint_handles_unpickleable_dataclass_fields():
+    class _AbsLike:
+        def __reduce_ex__(self, protocol):
+            del protocol
+            raise TypeError("cannot pickle 'abs_t' object")
+
+    @dataclass(frozen=True)
+    class _Wrapper:
+        field: object
+
+    assert isinstance(backend_object_fingerprint(_Wrapper(_AbsLike())), str)
 
 
 def test_import_tt_thrml_without_torch_keeps_minimal_root_surface(monkeypatch):

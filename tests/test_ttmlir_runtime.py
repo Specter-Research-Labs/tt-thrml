@@ -15,7 +15,7 @@ except ImportError:
 from tt_thrml.compiler.device_contract import HostFallbackError
 from tt_thrml.compiler.ttmlir.tensor_bridge import execute_single_output_flatbuffer
 from tt_thrml.compiler.ttmlir import runtime as ttmlir_runtime
-from tt_thrml.compiler.ttmlir.runtime import make_ttmlir_config
+from tt_thrml.compiler.ttmlir.runtime import make_ttmlir_config, restore_output_tensor
 
 
 def test_ttmlir_config_normalizes_paths_and_defaults_tools(tmp_path: Path):
@@ -215,6 +215,34 @@ def test_execute_single_output_flatbuffer_skips_host_input_factory_when_direct_b
 
     assert seen["inputs"] == direct_inputs
     assert isinstance(result, _FakeDeviceOutput)
+
+
+def test_restore_output_tensor_skips_redundant_cast_when_dtype_names_match():
+    class _FakeTTNN:
+        def __init__(self):
+            self.typecast_calls = 0
+
+        def typecast(self, value, *, dtype):
+            self.typecast_calls += 1
+            raise AssertionError("typecast should not be called for matching dtypes")
+
+    class _FakeOutput:
+        dtype = "DataType.Float32"
+        layout = "row_major"
+
+    fake_ttnn = _FakeTTNN()
+    output = _FakeOutput()
+
+    restored = restore_output_tensor(
+        fake_ttnn,
+        device="fake:0",
+        output=output,
+        output_dtype=torch.float32,
+        output_layout="row_major",
+    )
+
+    assert restored is output
+    assert fake_ttnn.typecast_calls == 0
 
 
 def test_borrow_runtime_session_separates_cache_by_device_runtime(monkeypatch, tmp_path):

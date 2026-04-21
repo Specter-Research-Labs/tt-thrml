@@ -69,9 +69,7 @@ class ParameterFamilyHandler:
     family: ParameterFamily
     compute_stage: str
     sample_stage: str
-    compute_interaction_partial: Callable[..., object]
-    compute_interaction_group_partial: Callable[..., object]
-    initialize_parameters: Callable[..., object]
+    compute_block_parameters: Callable[..., object]
     sample: Callable[..., object]
     prepare_batch_sample_inputs: Callable[..., object | None]
     select_prepared_random: Callable[..., PreparedFamilyRandom]
@@ -954,6 +952,65 @@ def _initialize_gaussian_parameters(executor, block: CompiledBlock, batch_size: 
     return executor._ensure_tensor_batch_size(runtime.zero_parameters, batch_size)
 
 
+def _block_batch_size(executor, block: CompiledBlock) -> int:
+    return int(executor._block_state_slots[block.state_view.block_index].shape[0])
+
+
+def _block_parameter_groups(block: CompiledBlock):
+    payload = getattr(block, "parameter_payload", None)
+    if payload is not None:
+        return payload.groups
+    return tuple(getattr(block, "interactions", ()))
+
+
+def _accumulate_parameter_groups(
+    executor,
+    block: CompiledBlock,
+    *,
+    initial_parameters,
+    group_compute: Callable[..., object],
+):
+    parameters = initial_parameters
+    for group in _block_parameter_groups(block):
+        partial = group_compute(executor, block, group)
+        parameters = executor.ttnn.add(parameters, partial)
+    return parameters
+
+
+def _compute_spin_block_parameters(executor, block: CompiledBlock):
+    batch_size = _block_batch_size(executor, block)
+    return _accumulate_parameter_groups(
+        executor,
+        block,
+        initial_parameters=_initialize_spin_parameters(executor, block, batch_size),
+        group_compute=_compute_spin_interaction_group_partial,
+    )
+
+
+def _compute_categorical_block_parameters(executor, block: CompiledBlock):
+    batch_size = _block_batch_size(executor, block)
+    return _accumulate_parameter_groups(
+        executor,
+        block,
+        initial_parameters=_initialize_categorical_parameters(
+            executor, block, batch_size
+        ),
+        group_compute=_compute_categorical_interaction_group_partial,
+    )
+
+
+def _compute_gaussian_block_parameters(executor, block: CompiledBlock):
+    batch_size = _block_batch_size(executor, block)
+    return _accumulate_parameter_groups(
+        executor,
+        block,
+        initial_parameters=_initialize_gaussian_parameters(
+            executor, block, batch_size
+        ),
+        group_compute=_compute_gaussian_interaction_group_partial,
+    )
+
+
 def _sample_spin_parameters(
     executor,
     block: CompiledBlock,
@@ -1148,9 +1205,7 @@ PARAMETER_FAMILY_HANDLERS: dict[ParameterFamily, ParameterFamilyHandler] = {
         family=SPIN_PARAMETER_FAMILY,
         compute_stage="compute_block_parameters.spin",
         sample_stage="sample_block.spin",
-        compute_interaction_partial=_compute_spin_interaction_partial,
-        compute_interaction_group_partial=_compute_spin_interaction_group_partial,
-        initialize_parameters=_initialize_spin_parameters,
+        compute_block_parameters=_compute_spin_block_parameters,
         sample=_sample_spin_parameters,
         prepare_batch_sample_inputs=_prepare_spin_batch_sample_inputs,
         select_prepared_random=_select_spin_prepared_random,
@@ -1161,9 +1216,7 @@ PARAMETER_FAMILY_HANDLERS: dict[ParameterFamily, ParameterFamilyHandler] = {
         family=CATEGORICAL_PARAMETER_FAMILY,
         compute_stage="compute_block_parameters.categorical",
         sample_stage="sample_block.categorical",
-        compute_interaction_partial=_compute_categorical_interaction_partial,
-        compute_interaction_group_partial=_compute_categorical_interaction_group_partial,
-        initialize_parameters=_initialize_categorical_parameters,
+        compute_block_parameters=_compute_categorical_block_parameters,
         sample=_sample_categorical_parameters,
         prepare_batch_sample_inputs=_prepare_categorical_batch_sample_inputs,
         select_prepared_random=_select_categorical_prepared_random,
@@ -1174,9 +1227,7 @@ PARAMETER_FAMILY_HANDLERS: dict[ParameterFamily, ParameterFamilyHandler] = {
         family=GAUSSIAN_PARAMETER_FAMILY,
         compute_stage="compute_block_parameters.gaussian",
         sample_stage="sample_block.gaussian",
-        compute_interaction_partial=_compute_gaussian_interaction_partial,
-        compute_interaction_group_partial=_compute_gaussian_interaction_group_partial,
-        initialize_parameters=_initialize_gaussian_parameters,
+        compute_block_parameters=_compute_gaussian_block_parameters,
         sample=_sample_gaussian_parameters,
         prepare_batch_sample_inputs=_prepare_gaussian_batch_sample_inputs,
         select_prepared_random=_select_gaussian_prepared_random,

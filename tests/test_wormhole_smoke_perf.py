@@ -168,6 +168,12 @@ class RunMetrics:
     official_artifacts: dict[str, str]
 
 
+@dataclass
+class DispatchCounts:
+    total: int
+    by_family: dict[str, int]
+
+
 class ThreadSafeRuntimeProfile:
     def __init__(self):
         self._inner = RuntimeProfile()
@@ -434,24 +440,36 @@ def _count_ttmlir_dispatches():
         ("categorical", ttmlir_categorical_theta),
         ("gaussian", ttmlir_gaussian_canonical),
     )
-    counts: dict[str, int] = {family: 0 for family, _ in modules}
+    counts = DispatchCounts(
+        total=0,
+        by_family={family: 0 for family, _ in modules},
+    )
     lock = threading.Lock()
+    tt_runtime = ttmlir_runtime._import_ttrt_runtime()
+    original_submit = tt_runtime.submit
     originals = []
+
+    def _wrap_submit(*args, _original=original_submit, **kwargs):
+        with lock:
+            counts.total += 1
+        return _original(*args, **kwargs)
 
     for family, module in modules:
         original = module.run_flatbuffer
 
         def _wrap(*args, _family=family, _original=original, **kwargs):
             with lock:
-                counts[_family] += 1
+                counts.by_family[_family] += 1
             return _original(*args, **kwargs)
 
         originals.append((module, original))
         module.run_flatbuffer = _wrap
 
+    tt_runtime.submit = _wrap_submit
     try:
         yield counts
     finally:
+        tt_runtime.submit = original_submit
         for module, original in originals:
             module.run_flatbuffer = original
 
@@ -571,8 +589,10 @@ def _run_single_job(
     return RunMetrics(
         wall_seconds=wall_seconds,
         total_sample_count=int(schedule.n_samples),
-        dispatch_count=sum(dispatch_counts.values()),
-        dispatch_count_by_family={key: value for key, value in dispatch_counts.items() if value},
+        dispatch_count=dispatch_counts.total,
+        dispatch_count_by_family={
+            key: value for key, value in dispatch_counts.by_family.items() if value
+        },
         host_to_device_transfers=host_to_device,
         device_to_host_transfers=device_to_host,
         peak_device_memory_bytes=max(peak_values) if peak_values else None,
@@ -634,8 +654,10 @@ def _run_many_jobs(
     return RunMetrics(
         wall_seconds=wall_seconds,
         total_sample_count=int(schedule.n_samples) * len(keys),
-        dispatch_count=sum(dispatch_counts.values()),
-        dispatch_count_by_family={key: value for key, value in dispatch_counts.items() if value},
+        dispatch_count=dispatch_counts.total,
+        dispatch_count_by_family={
+            key: value for key, value in dispatch_counts.by_family.items() if value
+        },
         host_to_device_transfers=host_to_device,
         device_to_host_transfers=device_to_host,
         peak_device_memory_bytes=max(peak_values) if peak_values else None,

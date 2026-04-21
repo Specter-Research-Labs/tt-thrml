@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict, is_dataclass
+from dataclasses import fields, is_dataclass
 from enum import Enum
 import hashlib
 import json
@@ -21,7 +21,9 @@ def _is_real_torch_tensor(value: object) -> bool:
     return isinstance(value, tensor_type)
 
 
-def _normalize(value: Any):
+def _normalize(value: Any, *, _seen: set[int] | None = None):
+    if _seen is None:
+        _seen = set()
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
     if isinstance(value, bytes):
@@ -53,28 +55,38 @@ def _normalize(value: Any):
             "shape": tuple(int(dim) for dim in detached.shape),
             "sha256": hashlib.sha256(detached.numpy().tobytes()).hexdigest(),
         }
+    object_id = id(value)
+    if object_id in _seen:
+        return {
+            "type": f"{type(value).__module__}.{type(value).__qualname__}",
+            "cycle": True,
+        }
+    _seen.add(object_id)
     if isinstance(value, dict):
         return {
             "type": "dict",
             "items": [
-                (_normalize(key), _normalize(inner_value))
+                (_normalize(key, _seen=_seen), _normalize(inner_value, _seen=_seen))
                 for key, inner_value in sorted(value.items(), key=lambda item: repr(item[0]))
             ],
         }
     if isinstance(value, (list, tuple)):
         return {
             "type": type(value).__name__,
-            "items": [_normalize(item) for item in value],
+            "items": [_normalize(item, _seen=_seen) for item in value],
         }
     if isinstance(value, set):
         return {
             "type": "set",
-            "items": sorted((_normalize(item) for item in value), key=repr),
+            "items": sorted((_normalize(item, _seen=_seen) for item in value), key=repr),
         }
     if is_dataclass(value):
         return {
             "type": type(value).__name__,
-            "fields": _normalize(asdict(value)),
+            "fields": {
+                field.name: _normalize(getattr(value, field.name), _seen=_seen)
+                for field in fields(value)
+            },
         }
     if hasattr(value, "__dict__"):
         public_items = {
@@ -84,7 +96,7 @@ def _normalize(value: Any):
         }
         return {
             "type": f"{type(value).__module__}.{type(value).__qualname__}",
-            "fields": _normalize(public_items),
+            "fields": _normalize(public_items, _seen=_seen),
         }
     return {
         "type": f"{type(value).__module__}.{type(value).__qualname__}",

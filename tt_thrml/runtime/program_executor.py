@@ -35,7 +35,6 @@ from .compiled_program import (
     CompiledDirectSourcePlan,
     CompiledGatherSourcePlan,
     CompiledInteraction,
-    CompiledInteractionGroup,
     CompiledProgram,
 )
 from .family_handlers import (
@@ -474,37 +473,7 @@ class TTProgramExecutor:
 
         def _compute():
             self._require_state()
-            batch_size = int(
-                self._block_state_slots[block.state_view.block_index].shape[0]
-            )
-            parameters = handler.initialize_parameters(
-                self,
-                block,
-                batch_size,
-            )
-            for interaction in block.interactions:
-                if isinstance(interaction, CompiledInteractionGroup):
-                    partial = handler.compute_interaction_group_partial(
-                        self,
-                        block,
-                        interaction,
-                    )
-                else:
-                    spin_sources, categorical_sources, continuous_sources = (
-                        self._gather_interaction_sources(
-                            block,
-                            interaction,
-                        )
-                    )
-                    partial = handler.compute_interaction_partial(
-                        self,
-                        block,
-                        interaction,
-                        spin_sources,
-                        categorical_sources,
-                        continuous_sources,
-                    )
-                parameters = self.ttnn.add(parameters, partial)
+            parameters = handler.compute_block_parameters(self, block)
             return self._transform_sampler_parameters(
                 block=block,
                 parameters=parameters,

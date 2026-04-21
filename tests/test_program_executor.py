@@ -4,6 +4,7 @@ import sys
 import types
 from types import SimpleNamespace
 
+import jax
 import pytest
 
 if "torch" not in sys.modules:
@@ -90,7 +91,7 @@ def test_run_sweep_batch_supports_mixed_stateless_family_programs(monkeypatch):
                 "supports_batch_sampling": True,
             }
         )
-        executor.run_sweep_batch(("k0", "k1"))
+        executor.run_sweep_batch((jax.random.PRNGKey(0), jax.random.PRNGKey(1)))
     finally:
         PARAMETER_FAMILY_HANDLERS.clear()
         PARAMETER_FAMILY_HANDLERS.update(original)
@@ -101,7 +102,7 @@ def test_run_sweep_batch_supports_mixed_stateless_family_programs(monkeypatch):
 def test_run_sweep_batch_rejects_programs_without_batched_family_support():
     executor = _fake_executor()
     with pytest.raises(TypeError, match="batched sampling support"):
-        executor.run_sweep_batch(("k0", "k1"))
+        executor.run_sweep_batch((jax.random.PRNGKey(0), jax.random.PRNGKey(1)))
 
 
 def test_run_blocks_prepares_bulk_randoms_once_per_block(monkeypatch):
@@ -128,7 +129,7 @@ def test_run_blocks_prepares_bulk_randoms_once_per_block(monkeypatch):
         executor.run_sweep = lambda key, *, sample_keys=None, prepared_randoms_by_block=None: run_calls.append(
             (key, sample_keys, prepared_randoms_by_block)
         )
-        executor.run_blocks("root-key", n_iters=3)
+        executor.run_blocks(jax.random.PRNGKey(0), n_iters=3)
     finally:
         PARAMETER_FAMILY_HANDLERS.clear()
         PARAMETER_FAMILY_HANDLERS.update(original)
@@ -167,7 +168,7 @@ def test_run_sweep_prepares_single_iteration_randoms_up_front():
             sample_calls.append((block_index, sample_key, prepared_random)),
             sampler_state,
         )
-        executor.run_sweep("iter-root")
+        executor.run_sweep(jax.random.PRNGKey(0))
     finally:
         PARAMETER_FAMILY_HANDLERS.clear()
         PARAMETER_FAMILY_HANDLERS.update(original)

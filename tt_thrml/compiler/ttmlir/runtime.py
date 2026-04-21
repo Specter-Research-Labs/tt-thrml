@@ -427,6 +427,31 @@ def _is_torch_tensor(value) -> bool:
     return isinstance(value, tensor_type)
 
 
+def _normalized_dtype_name(dtype) -> str | None:
+    if dtype is None:
+        return None
+    text = str(dtype).lower()
+    if "bfloat16" in text or text == "bf16":
+        return "bfloat16"
+    if "float32" in text or text.endswith("float"):
+        return "float32"
+    if "uint32" in text:
+        return "uint32"
+    if "int32" in text:
+        return "int32"
+    if "int64" in text:
+        return "int64"
+    return text.replace("torch.", "").replace("dtype.", "")
+
+
+def _dtype_matches(actual, expected) -> bool:
+    if actual == expected:
+        return True
+    actual_name = _normalized_dtype_name(actual)
+    expected_name = _normalized_dtype_name(expected)
+    return actual_name is not None and actual_name == expected_name
+
+
 def _resolve_runtime_utils_module(tt_runtime):
     if callable(getattr(tt_runtime, "create_runtime_device_from_ttnn", None)):
         return tt_runtime
@@ -578,14 +603,12 @@ def restore_output_tensor(
         )
 
     restored = output
-    current_layout = getattr(restored, "layout", None)
-    if output_layout is not None and current_layout is not None and current_layout != output_layout:
-        to_layout = getattr(ttnn, "to_layout", None)
-        if callable(to_layout):
-            restored = to_layout(restored, output_layout)
-
     current_dtype = getattr(restored, "dtype", None)
-    if output_dtype is not None and current_dtype is not None and current_dtype != output_dtype:
+    if (
+        output_dtype is not None
+        and current_dtype is not None
+        and not _dtype_matches(current_dtype, output_dtype)
+    ):
         typecast = getattr(ttnn, "typecast", None)
         if callable(typecast):
             restored = typecast(restored, dtype=output_dtype)
@@ -593,6 +616,12 @@ def restore_output_tensor(
             to_dtype = getattr(ttnn, "to_dtype", None)
             if callable(to_dtype):
                 restored = to_dtype(restored, output_dtype)
+
+    current_layout = getattr(restored, "layout", None)
+    if output_layout is not None and current_layout is not None and current_layout != output_layout:
+        to_layout = getattr(ttnn, "to_layout", None)
+        if callable(to_layout):
+            restored = to_layout(restored, output_layout)
 
     final_layout = getattr(restored, "layout", None)
     if output_layout is not None and final_layout is not None and final_layout != output_layout:
@@ -605,7 +634,11 @@ def restore_output_tensor(
         )
 
     final_dtype = getattr(restored, "dtype", None)
-    if output_dtype is not None and final_dtype is not None and final_dtype != output_dtype:
+    if (
+        output_dtype is not None
+        and final_dtype is not None
+        and not _dtype_matches(final_dtype, output_dtype)
+    ):
         raise_host_fallback_disabled(
             "TT-MLIR output dtype restoration",
             remedy=(

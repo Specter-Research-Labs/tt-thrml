@@ -27,6 +27,7 @@ from ..runtime_config import (
 from .interaction_lowering import lower_block_interactions
 from ..runtime.compiled_program import (
     CompiledBlock,
+    CompiledBlockParameterPayload,
     CompiledCategoricalFamilyRuntime,
     CompiledDirectSourcePlan,
     CompiledGatherShard,
@@ -427,9 +428,9 @@ def _compile_spin_or_gaussian_interaction_group(
     *,
     interactions: list[CompiledInteraction],
     context: _CompileContext,
-) -> CompiledInteraction | CompiledInteractionGroup:
-    if len(interactions) == 1:
-        return interactions[0]
+) -> CompiledInteractionGroup:
+    if not interactions:
+        raise ValueError("Cannot compile an empty interaction group.")
 
     exemplar = interactions[0]
     total_interactions = sum(interaction.n_interactions for interaction in interactions)
@@ -487,9 +488,9 @@ def _compile_categorical_interaction_group(
     *,
     interactions: list[CompiledInteraction],
     context: _CompileContext,
-) -> CompiledInteraction | CompiledInteractionGroup:
-    if len(interactions) == 1:
-        return interactions[0]
+) -> CompiledInteractionGroup:
+    if not interactions:
+        raise ValueError("Cannot compile an empty interaction group.")
 
     exemplar = interactions[0]
     n_nodes = exemplar.parameter_spec.shape_tail[1]
@@ -550,9 +551,9 @@ def _group_compiled_interactions(
     interactions: tuple[CompiledInteraction, ...],
     context: _CompileContext,
     parameter_family,
-) -> tuple[CompiledInteraction | CompiledInteractionGroup, ...]:
-    if len(interactions) <= 1:
-        return interactions
+) -> tuple[CompiledInteractionGroup, ...]:
+    if not interactions:
+        return ()
 
     grouped_by_signature: dict[tuple[object, ...], list[CompiledInteraction]] = {}
     signature_order: list[tuple[object, ...]] = []
@@ -563,7 +564,7 @@ def _group_compiled_interactions(
             signature_order.append(signature)
         grouped_by_signature[signature].append(interaction)
 
-    grouped_interactions: list[CompiledInteraction | CompiledInteractionGroup] = []
+    grouped_interactions: list[CompiledInteractionGroup] = []
     for signature in signature_order:
         bucket = grouped_by_signature[signature]
         if parameter_family == CATEGORICAL_PARAMETER_FAMILY:
@@ -995,6 +996,7 @@ def _compile_gaussian_block(
             layout=context.state_layout,
             dtype=context.spin_state_dtype,
         )
+        active_mask_spec = parameter_spec
         sources = _compile_interaction_sources(
             lowered_interaction=lowered_interaction,
             global_slots=global_slots,
@@ -1220,7 +1222,7 @@ def _compile_block(
         output_dtype=state_view.output_dtype,
         n_categories=n_categories,
         state_view=state_view,
-        interactions=interactions,
+        parameter_payload=CompiledBlockParameterPayload(groups=interactions),
         family_runtime=family_runtime,
     )
 

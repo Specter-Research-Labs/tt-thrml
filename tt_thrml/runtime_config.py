@@ -5,7 +5,7 @@ from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import TypeAlias
 
-from .fingerprint import backend_object_fingerprint
+from .fingerprint import backend_object_fingerprint, stable_fingerprint
 
 BackendDevice: TypeAlias = object
 BackendDevices: TypeAlias = BackendDevice | tuple[BackendDevice, ...] | list[BackendDevice]
@@ -121,6 +121,103 @@ def normalize_backend_devices(device: BackendDevices) -> tuple[BackendDevice, ..
     if isinstance(device, list):
         return tuple(device)
     return (device,)
+
+
+def _callable_attr(value: object, name: str):
+    attr = getattr(value, name, None)
+    if callable(attr):
+        try:
+            return attr()
+        except TypeError:
+            return None
+    return attr
+
+
+def _normalize_simple_cache_value(value):
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, Enum):
+        return {
+            "enum_type": f"{type(value).__module__}.{type(value).__qualname__}",
+            "value": value.value,
+        }
+    if isinstance(value, (tuple, list)):
+        return tuple(_normalize_simple_cache_value(item) for item in value)
+    return repr(value)
+
+
+def _normalize_device_ids_for_cache(device: BackendDevice) -> tuple[int, ...]:
+    device_ids = _callable_attr(device, "get_device_ids")
+    if device_ids is not None:
+        try:
+            return tuple(int(device_id) for device_id in device_ids)
+        except TypeError:
+            pass
+
+    device_id = _callable_attr(device, "id")
+    if device_id is not None:
+        try:
+            return (int(device_id),)
+        except (TypeError, ValueError):
+            pass
+
+    device_id = getattr(device, "device_id", None)
+    if device_id is not None:
+        try:
+            return (int(device_id),)
+        except (TypeError, ValueError):
+            pass
+
+    return ()
+
+
+def _normalize_mesh_shape_for_cache(device: BackendDevice) -> tuple[int, ...]:
+    shape = getattr(device, "shape", None)
+    if shape is None:
+        return ()
+    try:
+        return tuple(int(dim) for dim in shape)
+    except TypeError:
+        dims = getattr(shape, "dims", None)
+        if callable(dims):
+            return tuple(int(shape[index]) for index in range(dims()))
+    return ()
+
+
+def _semantic_ttnn_key(ttnn: object) -> str:
+    payload = {
+        "kind": "ttnn_runtime",
+        "type": f"{type(ttnn).__module__}.{type(ttnn).__qualname__}",
+        "module_name": getattr(ttnn, "__name__", None),
+        "module_file": getattr(ttnn, "__file__", None),
+        "module_version": getattr(ttnn, "__version__", None),
+    }
+    return stable_fingerprint(payload)
+
+
+def _semantic_device_key(device: BackendDevice) -> str:
+    device_ids = _normalize_device_ids_for_cache(device)
+    mesh_shape = _normalize_mesh_shape_for_cache(device)
+    payload = {
+        "kind": "ttnn_device",
+        "type": f"{type(device).__module__}.{type(device).__qualname__}",
+        "device_ids": device_ids,
+        "mesh_shape": mesh_shape,
+        "arch": _normalize_simple_cache_value(_callable_attr(device, "arch")),
+        "device_type": _normalize_simple_cache_value(
+            getattr(device, "device_type", None)
+        ),
+        "name": _normalize_simple_cache_value(getattr(device, "name", None)),
+    }
+    if not device_ids and not mesh_shape and payload["arch"] is None:
+        payload["fallback"] = backend_object_fingerprint(
+            {
+                "type": payload["type"],
+                "name": payload["name"],
+                "device_type": payload["device_type"],
+            }
+        )
+    return stable_fingerprint(payload)
 
 
 def _normalize_parameter_kernel_ops_items(
@@ -314,11 +411,11 @@ class BackendBinding:
 
     @property
     def semantic_ttnn_key(self) -> str:
-        return backend_object_fingerprint(self.ttnn)
+        return _semantic_ttnn_key(self.ttnn)
 
     @property
     def device_key(self) -> tuple[str, ...]:
-        return tuple(backend_object_fingerprint(device) for device in self.devices)
+        return tuple(_semantic_device_key(device) for device in self.devices)
 
     @property
     def cache_key(
@@ -346,7 +443,7 @@ class BackendBinding:
         )
         return (
             ttnn_key,
-            backend_object_fingerprint(resolved_device),
+            _semantic_device_key(resolved_device),
             parameter_kernel_backend_key,
         )
 
@@ -368,7 +465,7 @@ class BackendBinding:
         ) = self.cache_key
         return (
             ttnn_key,
-            backend_object_fingerprint(resolved_device),
+            _semantic_device_key(resolved_device),
             parameter_kernel_backend_key,
             parameter_kernel_op_key,
         )

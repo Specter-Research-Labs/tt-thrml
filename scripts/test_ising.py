@@ -13,7 +13,7 @@ from jax import numpy as jnp
 import numpy as np
 import thrml
 from thrml.models import IsingEBM, IsingSamplingProgram, hinton_init
-from thrml.observers import MomentAccumulatorObserver, StateObserver
+from thrml.observers import MomentAccumulatorObserver
 import ttnn
 
 sys.path.insert(0, str(Path(__file__).parent.parent))

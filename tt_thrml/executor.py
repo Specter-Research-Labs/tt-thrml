@@ -23,7 +23,6 @@ from thrml.block_management import Block
 from .core import (
     Family,
     TTMLIRConfig,
-    CompiledFusedBlock,
     CompiledProgram,
     BulkRNGBuffers,
 )
@@ -161,12 +160,9 @@ class Executor:
             import ttrt.runtime as tt_runtime
         except ImportError as exc:
             raise RuntimeError("ttrt.runtime not available") from exc
-        runtime_utils = self._resolve_runtime_utils(tt_runtime)
-        if runtime_utils is None:
-            raise RuntimeError("TT-MLIR runtime bridge not available")
         self._tt_runtime = tt_runtime
-        self._runtime_utils = runtime_utils
-        self._runtime_device = runtime_utils.create_runtime_device_from_ttnn(self.device)
+        self._runtime_utils = tt_runtime
+        self._runtime_device = tt_runtime.create_runtime_device_from_ttnn(self.device)
 
     def _get_binary(self, artifact_path: Path) -> object:
         cached = self._binary_cache.get(artifact_path)
@@ -215,15 +211,6 @@ class Executor:
                 tt_runtime.deallocate_tensor(rt, force=True)
 
         return outputs
-
-    def _resolve_runtime_utils(self, tt_runtime):
-        if callable(getattr(tt_runtime, "create_runtime_device_from_ttnn", None)):
-            return tt_runtime
-        try:
-            from ttrt.runtime import _ttmlir_runtime
-            return getattr(_ttmlir_runtime, "utils", None)
-        except ImportError:
-            return None
 
     def observe(self, blocks: Sequence[Block]) -> dict:
         if self._global_state is None:

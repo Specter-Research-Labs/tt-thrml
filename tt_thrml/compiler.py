@@ -8,7 +8,6 @@ offset are baked into the StableHLO as constants.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from pathlib import Path
 import hashlib
 import json
@@ -30,16 +29,7 @@ from .core import (
     CompiledFusedBlock,
     CompiledProgram,
 )
-
-
-@dataclass(frozen=True)
-class _CompileContext:
-    ttnn: object
-    device: object
-    config: TTMLIRConfig
-    state_layout: object
-    state_dtype: object
-    index_dtype: object
+from .rng import make_rng_spec
 
 
 _ARTIFACT_CACHE: dict[str, Path] = {}
@@ -118,7 +108,6 @@ def _build_block_global_starts(gibbs_spec) -> tuple[tuple[int, ...], int]:
 def _build_interaction_spec(
     interaction,
     active_mask,
-    global_inds,
     global_slices,
     family: Family,
     n_nodes: int,
@@ -151,9 +140,7 @@ def _build_interaction_spec(
         )
 
     n_spin = int(lowered["n_spin"])
-    # Trailing dims beyond (n_nodes, n_terms, n_categories) each require one categorical source
     n_categorical_sources = max(0, weights.ndim - 3)
-    expected_slices = n_spin + n_categorical_sources
 
     gather_arrays: list[np.ndarray] = []
     for gslice in global_slices:
@@ -195,16 +182,13 @@ def _build_fused_block_spec(
     n_categories = _get_n_categories(block, family)
 
     interactions = []
-    for interaction, active_mask, global_inds, global_slices in zip(
+    for interaction, active_mask, global_slices in zip(
         program.per_block_interactions[block_index],
         program.per_block_interaction_active[block_index],
-        program.per_block_interaction_global_inds[block_index],
         program.per_block_interaction_global_slices[block_index],
     ):
         interactions.append(
-            _build_interaction_spec(
-                interaction, active_mask, global_inds, global_slices, family, n_nodes
-            )
+            _build_interaction_spec(interaction, active_mask, global_slices, family, n_nodes)
         )
 
     # CategoricalNode doesn't store n_categories; derive from weighted_mask shape
@@ -479,7 +463,7 @@ def _compile_block(
     gibbs_spec,
     block_global_start: int,
     total_nodes: int,
-    context: _CompileContext,
+    config: TTMLIRConfig,
 ) -> CompiledFusedBlock:
     family = _infer_family(block, gibbs_spec)
     spec = _build_fused_block_spec(
@@ -487,8 +471,7 @@ def _compile_block(
         block_global_start, total_nodes,
     )
     kernel = _make_fused_kernel(spec)
-    artifact_path = _compile_fused_kernel(context.config, spec, kernel)
-
+    artifact_path = _compile_fused_kernel(config, spec, kernel)
     return CompiledFusedBlock(spec=spec, kernel_artifact=artifact_path)
 
 
@@ -500,18 +483,9 @@ def compile_program(
     *,
     n_sweeps: int = 100,
 ) -> CompiledProgram:
-    state_layout = getattr(ttnn, "ROW_MAJOR_LAYOUT", None) or getattr(ttnn, "TILE_LAYOUT", None)
-    state_dtype = getattr(ttnn, "float32")
-    index_dtype = getattr(ttnn, "uint32", None) or getattr(ttnn, "int32")
-
-    context = _CompileContext(
-        ttnn=ttnn,
-        device=device,
-        config=config,
-        state_layout=state_layout,
-        state_dtype=state_dtype,
-        index_dtype=index_dtype,
-    )
+    state_layout = ttnn.ROW_MAJOR_LAYOUT
+    state_dtype = ttnn.float32
+    index_dtype = ttnn.uint32
 
     gibbs_spec = program.gibbs_spec
     block_global_starts, total_nodes = _build_block_global_starts(gibbs_spec)
@@ -523,11 +497,10 @@ def compile_program(
             compiled_blocks.append(
                 _compile_block(
                     program, block_index, block, gibbs_spec,
-                    block_global_starts[block_index], total_nodes, context,
+                    block_global_starts[block_index], total_nodes, config,
                 )
             )
         else:
-            # Clamped block: no kernel (state is fixed, never resampled)
             family = _infer_family(block, gibbs_spec)
             placeholder_spec = FusedBlockSpec(
                 block_index=block_index,
@@ -541,8 +514,6 @@ def compile_program(
             compiled_blocks.append(CompiledFusedBlock(spec=placeholder_spec, kernel_artifact=None))
 
     sampling_order = tuple(tuple(int(i) for i in group) for group in gibbs_spec.sampling_order)
-
-    from .rng import make_rng_spec
     rng_spec = make_rng_spec(tuple(compiled_blocks), n_sweeps)
 
     return CompiledProgram(

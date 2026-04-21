@@ -2,60 +2,26 @@
 
 from __future__ import annotations
 
-from math import prod
-
 from thrml.block_sampling import BlockSamplingProgram
 
 from .core import TTMLIRConfig
 from .executor import Executor
 
 
-def _mesh_shape(device) -> tuple[int, ...]:
-    """Extract mesh shape from device."""
-    shape = getattr(device, "shape", None)
-    if shape is None:
-        return ()
-    try:
-        return tuple(int(dim) for dim in shape)
-    except TypeError:
-        dims = getattr(shape, "dims", None)
-        if callable(dims):
-            return tuple(int(shape[i]) for i in range(dims()))
-        return ()
-
-
 def mesh_device_ids(device) -> tuple[int, ...]:
-    """Get device IDs from mesh device."""
     get_ids = getattr(device, "get_device_ids", None)
     if callable(get_ids):
         return tuple(int(d) for d in get_ids())
-    device_id = getattr(device, "id", None)
-    if isinstance(device_id, int):
-        return (device_id,)
     return ()
 
 
 def mesh_size(device) -> int:
-    """Get number of devices in mesh."""
     ids = mesh_device_ids(device)
-    if ids:
-        return len(ids)
-    shape = _mesh_shape(device)
-    if shape:
-        return prod(shape)
-    return 1
-
-
-def is_mesh_device(device) -> bool:
-    """Check if device is a multi-device mesh."""
-    return mesh_size(device) > 1
+    return len(ids) if ids else 1
 
 
 def mesh_barrier(ttnn, device) -> None:
-    """Synchronize across mesh devices."""
-    sync = getattr(ttnn, "synchronize_device", None)
-    if callable(sync):
-        sync(device)
+    ttnn.synchronize_device(device)
 
 
 class MeshExecutor(Executor):
@@ -90,5 +56,4 @@ def make_mesh_executor(
     *,
     n_sweeps: int = 100,
 ) -> MeshExecutor:
-    """Create mesh executor for THRML program."""
     return MeshExecutor(ttnn, device, program, config, n_sweeps=n_sweeps)

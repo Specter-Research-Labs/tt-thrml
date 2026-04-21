@@ -289,7 +289,7 @@ def run_wormhole(demo: Demo, key, *, ttnn, device, config, signpost, profile: bo
     if profile:
         summary = executor.timing_summary()
         if summary:
-            print(f"\n  [kernel timing]")
+            print("\n  [kernel timing]")
             for family, s in sorted(summary.items()):
                 print(
                     f"    {family:<12}  n={s['n']:>4}  "
@@ -384,7 +384,8 @@ def main() -> None:
             from tracy import signpost as _sp
             signpost = _sp
         except ImportError:
-            signpost = lambda **_: None
+            def signpost(**_):
+                pass
 
         system_desc = os.environ.get("SYSTEM_DESC_PATH")
         build_dir = os.environ.get("TTMLIR_BUILD_DIR")

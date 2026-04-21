@@ -145,7 +145,9 @@ class TTMLIRSpinGammaOp:
             flat_index_shape=None
             if inputs.flat_index is None
             else tensor_shape(inputs.flat_index),
-            flat_index_dtype=None if inputs.flat_index is None else torch.uint32,
+            flat_index_dtype=None
+            if inputs.flat_index is None
+            else getattr(inputs.flat_index, "dtype", torch.uint32),
             interaction_scale_shape=_default_scale_shape(
                 flat_weights_shape=tensor_shape(inputs.flat_weights),
                 flat_index_shape=None
@@ -158,25 +160,19 @@ class TTMLIRSpinGammaOp:
             n_interactions=inputs.n_interactions,
         )
         artifact = self._compile_artifact(signature)
-        direct_runtime_inputs = None
-        direct_index_dtype = getattr(inputs.flat_index, "dtype", None)
-        expected_index_dtype = getattr(ttnn, "uint32", None)
-        if inputs.flat_index is None or (
-            expected_index_dtype is not None and direct_index_dtype == expected_index_dtype
-        ):
-            direct_runtime_inputs = [inputs.flat_weights]
-            if inputs.flat_index is not None:
-                direct_runtime_inputs.append(inputs.flat_index)
-            direct_runtime_inputs.append(
-                inputs.interaction_scale
-                if inputs.interaction_scale is not None
-                else default_scale_tensor_like(
-                    ttnn,
-                    device=device,
-                    flat_weights=inputs.flat_weights,
-                    flat_index=inputs.flat_index,
-                )
+        direct_runtime_inputs = [inputs.flat_weights]
+        if inputs.flat_index is not None:
+            direct_runtime_inputs.append(inputs.flat_index)
+        direct_runtime_inputs.append(
+            inputs.interaction_scale
+            if inputs.interaction_scale is not None
+            else default_scale_tensor_like(
+                ttnn,
+                device=device,
+                flat_weights=inputs.flat_weights,
+                flat_index=inputs.flat_index,
             )
+        )
         return execute_single_output_flatbuffer(
             config=self.config,
             ttnn=ttnn,

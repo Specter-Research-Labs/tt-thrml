@@ -349,4 +349,11 @@ def test_group_compiled_interactions_merges_mixed_categorical_tail_sizes():
     assert isinstance(grouped[0], CompiledInteractionGroup)
     assert grouped[0].flat_weights.shape == (1, 4, 3, 3)
     assert grouped[0].active_mask.shape == (1, 4, 1, 1)
+    assert grouped[0].parameter_spec.shape_tail == interaction_scale_tensor_spec(
+        n_nodes=2,
+        n_interactions=2,
+        has_tail=True,
+        layout="row_major",
+        dtype=np.float32,
+    ).shape_tail
     assert np.all(grouped[0].flat_weights[:, :2, :, 1:] == 0.0)

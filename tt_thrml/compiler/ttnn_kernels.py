@@ -48,11 +48,7 @@ def select_last_dim_expected(
     values: torch.Tensor,
     index: torch.Tensor,
 ) -> torch.Tensor:
-    selector = torch.nn.functional.one_hot(
-        index.squeeze(-1).to(torch.int64),
-        num_classes=values.shape[-1],
-    ).to(values.dtype)
-    return torch.sum(values * selector, dim=-1, keepdim=True)
+    return torch.gather(values, dim=-1, index=index.to(torch.int64))
 
 
 def _select_gamma_weights(

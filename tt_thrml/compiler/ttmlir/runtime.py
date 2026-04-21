@@ -594,6 +594,26 @@ def restore_output_tensor(
             if callable(to_dtype):
                 restored = to_dtype(restored, output_dtype)
 
+    final_layout = getattr(restored, "layout", None)
+    if output_layout is not None and final_layout is not None and final_layout != output_layout:
+        raise_host_fallback_disabled(
+            "TT-MLIR output layout restoration",
+            remedy=(
+                "Expose ttnn.to_layout for direct TTNN tensors or compile the kernel "
+                "to produce the requested output layout."
+            ),
+        )
+
+    final_dtype = getattr(restored, "dtype", None)
+    if output_dtype is not None and final_dtype is not None and final_dtype != output_dtype:
+        raise_host_fallback_disabled(
+            "TT-MLIR output dtype restoration",
+            remedy=(
+                "Expose ttnn.typecast/to_dtype for direct TTNN tensors or compile the "
+                "kernel to produce the requested output dtype."
+            ),
+        )
+
     return restored
 
 

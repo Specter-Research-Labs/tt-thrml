@@ -147,7 +147,9 @@ class TTMLIRCategoricalThetaOp:
             flat_index_shape=None
             if inputs.flat_index is None
             else tensor_shape(inputs.flat_index),
-            flat_index_dtype=None if inputs.flat_index is None else torch.uint32,
+            flat_index_dtype=None
+            if inputs.flat_index is None
+            else getattr(inputs.flat_index, "dtype", torch.uint32),
             interaction_scale_shape=tensor_shape(inputs.interaction_scale),
             interaction_scale_dtype=torch.float32,
             n_nodes=inputs.n_nodes,

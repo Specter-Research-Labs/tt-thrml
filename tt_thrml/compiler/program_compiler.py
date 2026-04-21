@@ -496,6 +496,7 @@ def _compile_categorical_interaction_group(
     total_interactions = sum(interaction.n_interactions for interaction in interactions)
     n_categories = exemplar.flat_weights_spec.shape_tail[1]
     tail_size = max(interaction.flat_weights_spec.shape_tail[2] for interaction in interactions)
+    has_tail = tail_size > 1
 
     flat_weights_group = _concat_tensors(
         context,
@@ -523,7 +524,7 @@ def _compile_categorical_interaction_group(
         parameter_spec=interaction_scale_tensor_spec(
             n_nodes=n_nodes,
             n_interactions=total_interactions,
-            has_tail=bool(exemplar.tail_shape),
+            has_tail=has_tail,
             layout=exemplar.parameter_spec.layout,
             dtype=exemplar.parameter_spec.dtype,
         ),
@@ -593,6 +594,7 @@ def _compile_spin_block(
     context: _CompileContext,
 ):
     interactions: list[CompiledInteraction] = []
+    static_gaussian_parameters = None
     pending_constant_spin_partial = None
 
     for lowered_interaction in lower_block_interactions(
@@ -689,54 +691,12 @@ def _compile_spin_block(
         )
 
     if pending_constant_spin_partial is not None:
-        interactions.append(
-            CompiledInteraction(
-                contribution_kind="default",
-                n_interactions=int(pending_constant_spin_partial.shape[3]),
-                tail_shape=(),
-                categorical_tail_strides=(),
-                execution=CompiledInteractionExecution(
-                    spin_sources=tuple(),
-                    categorical_sources=tuple(),
-                    continuous_sources=tuple(),
-                ),
-                flat_weights=_float_tensor(
-                    context,
-                    pending_constant_spin_partial,
-                    layout=context.state_layout,
-                ),
-                active_mask=_float_tensor(
-                    context,
-                    np.ones_like(pending_constant_spin_partial, dtype=np.float32),
-                    layout=context.state_layout,
-                ),
-                active_mask_is_all_ones=True,
-                parameter_spec=interaction_scale_tensor_spec(
-                    state_view.n_nodes,
-                    int(pending_constant_spin_partial.shape[3]),
-                    has_tail=False,
-                    layout=context.state_layout,
-                    dtype=context.spin_state_dtype,
-                ),
-                flat_weights_spec=spin_gaussian_weight_tensor_spec(
-                    n_nodes=state_view.n_nodes,
-                    n_interactions=int(pending_constant_spin_partial.shape[3]),
-                    tail_size=1,
-                    layout=context.state_layout,
-                    dtype=context.spin_state_dtype,
-                ),
-                active_mask_spec=interaction_scale_tensor_spec(
-                    n_nodes=state_view.n_nodes,
-                    n_interactions=int(pending_constant_spin_partial.shape[3]),
-                    has_tail=False,
-                    layout=context.state_layout,
-                    dtype=context.spin_state_dtype,
-                ),
-                fused_static_theta_bias=False,
-                use_single_node_fused_theta_scale_fast_path=False,
-                fused_static_theta_prefix=None,
-            )
-        )
+        pending_constant_spin_partial = pending_constant_spin_partial.reshape(
+            1,
+            1,
+            state_view.n_nodes,
+            -1,
+        ).sum(axis=3, keepdims=True)
 
     return (
         _group_compiled_interactions(
@@ -745,12 +705,20 @@ def _compile_spin_block(
             parameter_family=SPIN_PARAMETER_FAMILY,
         ),
         CompiledSpinFamilyRuntime(
-            zero_parameters=context.ttnn.full(
-                [1, 1, state_view.n_nodes, 1],
-                fill_value=0.0,
-                dtype=context.spin_state_dtype,
-                layout=context.state_layout,
-                device=context.device,
+            zero_parameters=(
+                _float_tensor(
+                    context,
+                    pending_constant_spin_partial,
+                    layout=context.state_layout,
+                )
+                if pending_constant_spin_partial is not None
+                else context.ttnn.full(
+                    [1, 1, state_view.n_nodes, 1],
+                    fill_value=0.0,
+                    dtype=context.spin_state_dtype,
+                    layout=context.state_layout,
+                    device=context.device,
+                )
             ),
             parameter_spec=spin_parameter_tensor_spec(
                 n_nodes=state_view.n_nodes,
@@ -879,6 +847,27 @@ def _compile_categorical_block(
                 axis=2,
             ).reshape(1, n_nodes * (n_interactions + 1), 1, 1)
             n_interactions += 1
+            flat_weights_spec = categorical_weight_tensor_spec(
+                n_nodes=n_nodes,
+                n_interactions=n_interactions,
+                n_categories=n_categories,
+                tail_size=1,
+                layout=context.categorical_layout,
+                dtype=context.spin_state_dtype,
+            )
+            parameter_spec = interaction_scale_tensor_spec(
+                n_nodes=n_nodes,
+                n_interactions=n_interactions,
+                has_tail=False,
+                layout=context.categorical_layout,
+                dtype=context.spin_state_dtype,
+            )
+            active_mask_spec = categorical_active_mask_tensor_spec(
+                n_nodes=n_nodes,
+                n_interactions=n_interactions,
+                layout=context.categorical_layout,
+                dtype=context.spin_state_dtype,
+            )
             pending_constant_theta_bias = None
             fused_static_theta_bias = True
             fused_static_theta_prefix = context.ttnn.full(
@@ -980,6 +969,7 @@ def _compile_gaussian_block(
     context: _CompileContext,
 ):
     interactions: list[CompiledInteraction] = []
+    static_gaussian_parameters = None
 
     for lowered_interaction in lower_block_interactions(
         program,
@@ -1025,6 +1015,31 @@ def _compile_gaussian_block(
             )
             active_mask = active_np.reshape(1, *parameter_spec.shape_tail)
 
+        if not sources:
+            constant_partial = (flat_weights * active_mask).reshape(
+                1,
+                1,
+                n_nodes,
+                -1,
+            ).sum(axis=3, keepdims=True)
+            zeros = np.zeros_like(constant_partial, dtype=np.float32)
+            contribution_kind = lowered_interaction.contribution.contribution_kind
+            if contribution_kind == "linear":
+                constant_parameters = np.concatenate([constant_partial, zeros], axis=-1)
+            elif contribution_kind == "precision":
+                constant_parameters = np.concatenate([zeros, constant_partial], axis=-1)
+            else:
+                raise TypeError(
+                    "Gaussian constant folding only supports linear and precision "
+                    f"contribution kinds, got {contribution_kind!r}."
+                )
+            static_gaussian_parameters = (
+                constant_parameters
+                if static_gaussian_parameters is None
+                else static_gaussian_parameters + constant_parameters
+            )
+            continue
+
         interactions.append(
             CompiledInteraction(
                 contribution_kind=lowered_interaction.contribution.contribution_kind,
@@ -1053,7 +1068,7 @@ def _compile_gaussian_block(
                 active_mask_is_all_ones=bool(np.all(active_np == 1.0)),
                 parameter_spec=parameter_spec,
                 flat_weights_spec=flat_weights_spec,
-                active_mask_spec=parameter_spec,
+                active_mask_spec=active_mask_spec,
                 fused_static_theta_bias=False,
                 use_single_node_fused_theta_scale_fast_path=False,
                 fused_static_theta_prefix=None,
@@ -1067,12 +1082,20 @@ def _compile_gaussian_block(
             parameter_family=GAUSSIAN_PARAMETER_FAMILY,
         ),
         CompiledGaussianFamilyRuntime(
-            zero_parameters=context.ttnn.full(
-                [1, 1, state_view.n_nodes, 2],
-                fill_value=0.0,
-                dtype=context.spin_state_dtype,
-                layout=context.state_layout,
-                device=context.device,
+            zero_parameters=(
+                _float_tensor(
+                    context,
+                    static_gaussian_parameters,
+                    layout=context.state_layout,
+                )
+                if static_gaussian_parameters is not None
+                else context.ttnn.full(
+                    [1, 1, state_view.n_nodes, 2],
+                    fill_value=0.0,
+                    dtype=context.spin_state_dtype,
+                    layout=context.state_layout,
+                    device=context.device,
+                )
             ),
             linear_selector=_float_tensor(
                 context,

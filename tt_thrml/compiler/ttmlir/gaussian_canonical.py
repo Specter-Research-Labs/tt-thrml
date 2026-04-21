@@ -138,7 +138,9 @@ class TTMLIRGaussianCanonicalOp:
             flat_index_shape=None
             if inputs.flat_index is None
             else tensor_shape(inputs.flat_index),
-            flat_index_dtype=None if inputs.flat_index is None else torch.uint32,
+            flat_index_dtype=None
+            if inputs.flat_index is None
+            else getattr(inputs.flat_index, "dtype", torch.uint32),
             interaction_scale_shape=_default_scale_shape(
                 flat_weights_shape=tensor_shape(inputs.flat_weights),
                 flat_index_shape=None

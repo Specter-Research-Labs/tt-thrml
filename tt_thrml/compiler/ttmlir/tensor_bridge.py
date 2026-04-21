@@ -118,6 +118,7 @@ def execute_single_output_flatbuffer(
     op_name: str,
     direct_input_tensors=None,
     input_tensors_factory=None,
+    allow_host_input_tensors: bool = False,
     run_flatbuffer_fn=run_flatbuffer,
     supports_direct_ttnn_inputs_fn=supports_direct_ttnn_inputs,
     supports_direct_ttnn_outputs_fn=supports_direct_ttnn_outputs,
@@ -131,6 +132,14 @@ def execute_single_output_flatbuffer(
                 f"{op_name} TT-MLIR input materialization",
                 remedy="Use a runtime with direct TTNN bridge support.",
             )
+    elif not allow_host_input_tensors:
+        raise_host_fallback_disabled(
+            f"{op_name} TT-MLIR input materialization",
+            remedy=(
+                "Pass direct TTNN tensors to the runtime bridge. Host placeholder "
+                "inputs are only valid for explicit compiler/debug tests."
+            ),
+        )
     elif runtime_inputs is None:
         if input_tensors_factory is None:
             raise RuntimeError(

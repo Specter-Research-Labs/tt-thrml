@@ -5,6 +5,13 @@ import types
 
 import pytest
 
+try:
+    import torch  # noqa: F401
+except ImportError:
+    from tests.parity._torch_stub import install_torch_stub
+
+    install_torch_stub()
+
 from tt_thrml.compiler.device_contract import HostFallbackError
 from tt_thrml.compiler.ttmlir.tensor_bridge import execute_single_output_flatbuffer
 from tt_thrml.compiler.ttmlir import runtime as ttmlir_runtime
@@ -124,6 +131,38 @@ def test_execute_single_output_flatbuffer_rejects_host_output_fallback_by_defaul
             ),
             supports_direct_ttnn_inputs_fn=lambda **kwargs: True,
             supports_direct_ttnn_outputs_fn=lambda **kwargs: False,
+        )
+
+
+def test_execute_single_output_flatbuffer_rejects_host_placeholder_inputs_by_default(tmp_path):
+    config = ttmlir_runtime.TTMLIRConfig(
+        system_desc_path=tmp_path / "system_desc.ttsys",
+        artifact_root=tmp_path / "artifacts",
+    )
+
+    class _FakeTTNN:
+        bfloat16 = "bf16"
+        TILE_LAYOUT = "tile"
+
+    class _FakeOutput:
+        shape = (1, 1, 1, 1)
+        dtype = "bf16"
+        layout = "tile"
+
+    with pytest.raises(HostFallbackError, match="input materialization"):
+        execute_single_output_flatbuffer(
+            config=config,
+            ttnn=_FakeTTNN(),
+            device="fake:0",
+            flatbuffer_path=tmp_path / "kernel.ttnn",
+            input_tensors_factory=lambda: ["placeholder"],
+            output_reference=_FakeOutput(),
+            op_name="test-op",
+            run_flatbuffer_fn=lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("run_flatbuffer should not be called")
+            ),
+            supports_direct_ttnn_inputs_fn=lambda **kwargs: False,
+            supports_direct_ttnn_outputs_fn=lambda **kwargs: True,
         )
 
 

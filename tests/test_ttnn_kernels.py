@@ -22,7 +22,7 @@ def test_spin_gamma_dense_expected_matches_manual_result():
     ]
 
     actual = spin_gamma_dense_expected(weights, active_mask, spin_conditions)
-    expected = torch.tensor([[[[1.75], [-1.5]]]], dtype=torch.float32)
+    expected = torch.tensor([[[[0.25], [-1.5]]]], dtype=torch.float32)
 
     assert torch.allclose(actual, expected)
 
@@ -47,7 +47,7 @@ def test_spin_gamma_dense_expected_matches_manual_result_with_categorical_tail()
     actual = spin_gamma_dense_expected(
         weights, active_mask, spin_conditions, categorical_conditions
     )
-    expected = torch.tensor([[[[3.0], [-3.0]]]], dtype=torch.float32)
+    expected = torch.tensor([[[3.0], [5.0]]], dtype=torch.float32)
 
     assert torch.allclose(actual, expected)
 

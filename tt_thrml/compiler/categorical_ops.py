@@ -422,9 +422,7 @@ def ttnn_categorical_sampler(
                     [1, 1, plan.n_users, plan.padded_categories - current_categories],
                     fill_value=-1.0e4,
                     dtype=ttnn.bfloat16,
-                    layout=getattr(
-                        ttnn, "TILE_LAYOUT", getattr(ttnn, "ROW_MAJOR_LAYOUT")
-                    ),
+                    layout=_first_available_attr(ttnn, "TILE_LAYOUT", "ROW_MAJOR_LAYOUT"),
                     device=device,
                 ),
             ],
@@ -439,9 +437,7 @@ def ttnn_categorical_sampler(
                     [1, 1, 32 - plan.n_users, plan.padded_categories],
                     fill_value=0.0,
                     dtype=ttnn.bfloat16,
-                    layout=getattr(
-                        ttnn, "TILE_LAYOUT", getattr(ttnn, "ROW_MAJOR_LAYOUT")
-                    ),
+                    layout=_first_available_attr(ttnn, "TILE_LAYOUT", "ROW_MAJOR_LAYOUT"),
                     device=device,
                 ),
             ],

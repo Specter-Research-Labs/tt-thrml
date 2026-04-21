@@ -71,6 +71,9 @@ class Tensor:
     def unsqueeze(self, dim):
         return Tensor(np.expand_dims(self.array, axis=dim))
 
+    def sum(self, dim=None, keepdim=False):
+        return Tensor(np.sum(self.array, axis=dim, keepdims=keepdim))
+
     def expand(self, *shape):
         return Tensor(np.broadcast_to(self.array, shape))
 
@@ -217,6 +220,7 @@ def install_torch_stub():
     torch.concat = lambda values, dim=0: Tensor(
         np.concatenate([_coerce_array(value) for value in values], axis=dim)
     )
+    torch.cat = torch.concat
     torch.stack = lambda values, dim=0: Tensor(
         np.stack([_coerce_array(value) for value in values], axis=dim)
     )

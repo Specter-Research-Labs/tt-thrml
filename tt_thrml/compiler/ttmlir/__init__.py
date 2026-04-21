@@ -1,2 +1,0 @@
-"""TT-MLIR compiler helpers."""
-

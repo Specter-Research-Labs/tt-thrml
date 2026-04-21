@@ -1,21 +1,22 @@
+"""parity runner: upstream THRML (JAX reference) vs tt_thrml (TT hardware).
+
+Run directly: python -m tests.parity._parity_runner
+Requires: SYSTEM_DESC_PATH, TTMLIR_BUILD_DIR env vars, TT hardware device.
+"""
+
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Sequence
 from dataclasses import dataclass
-
-import numpy as np
-
-try:
-    import torch  # type: ignore
-except ImportError:
-    from ._torch_stub import install_torch_stub
-
-    torch = install_torch_stub()
+from pathlib import Path
 
 import equinox as eqx
 import jax
 import jax.numpy as jnp
+import numpy as np
+
 from thrml.block_management import Block
 from thrml.block_sampling import (
     BlockGibbsSpec,
@@ -35,97 +36,12 @@ from thrml.models.discrete_ebm import (
 from thrml.observers import MomentAccumulatorObserver
 from thrml.pgm import AbstractNode, CategoricalNode, SpinNode
 
-import tt_thrml
-import tt_thrml.runtime.backend_executor as backend_executor
-from tt_thrml.compiler.categorical_ops import reference_categorical_theta_op
-from tt_thrml.compiler.gaussian_ops import reference_gaussian_canonical_op
-from tt_thrml.compiler.spin_ops import reference_spin_gamma_op
+# GaussianConditional is a tt-local extension not yet in upstream THRML.
+# It is used for the upstream JAX reference side of gaussian/mixed scenarios.
 from tt_thrml.conditional_samplers import GaussianConditional
-from tt_thrml.runtime_config import (
-    CATEGORICAL_PARAMETER_FAMILY,
-    GAUSSIAN_PARAMETER_FAMILY,
-    SPIN_PARAMETER_FAMILY,
-    ParameterKernelBackend,
-    make_backend_binding,
-)
 
-
-def _install_parity_program_cache_identity():
-    # Golden parity only needs semantic execution, not production cache fingerprints.
-    backend_executor._program_cache_identity = (  # type: ignore[assignment]
-        lambda program: (id(program), f"parity:{id(program)}")
-    )
-
-
-_install_parity_program_cache_identity()
-
-
-class NumpyTTNN:
-    Tensor = torch.Tensor
-    bfloat16 = torch.float32
-    uint32 = getattr(torch, "uint32", torch.int64)
-    int32 = getattr(torch, "int32", torch.int64)
-    ROW_MAJOR_LAYOUT = "row_major"
-    TILE_LAYOUT = "tile"
-
-    def from_torch(self, value, *, dtype=None, layout=None, device=None, mesh_mapper=None):
-        del layout, device, mesh_mapper
-        tensor = value.clone() if isinstance(value, torch.Tensor) else torch.as_tensor(value)
-        return tensor.to(dtype) if dtype is not None else tensor
-
-    def to_torch(self, value):
-        return value.clone() if isinstance(value, torch.Tensor) else torch.as_tensor(value)
-
-    def full(self, shape, *, fill_value, dtype=None, layout=None, device=None):
-        del layout, device
-        return torch.full(shape, fill_value=fill_value, dtype=dtype or torch.float32)
-
-    def repeat(self, value, sizes):
-        return value.repeat(sizes)
-
-    def concat(self, values, dim=0):
-        return torch.concat(values, dim=dim)
-
-    def gather(self, values, dim, *, index):
-        return torch.gather(values, dim, index.to(torch.int64))
-
-    def multiply(self, lhs, rhs):
-        return lhs * rhs
-
-    def sum(self, value, *, dim, keepdim):
-        return torch.sum(value, dim=dim, keepdim=keepdim)
-
-    def add(self, lhs, rhs):
-        return lhs + rhs
-
-    def reciprocal(self, value):
-        return torch.reciprocal(value)
-
-    def sqrt(self, value):
-        return torch.sqrt(value)
-
-    def argmax(self, value, dim=None, keepdim=False, **kwargs):
-        del kwargs
-        return torch.argmax(value, dim=dim, keepdim=keepdim)
-
-    def gt(self, lhs, rhs):
-        return lhs > rhs
-
-    def where(self, condition, lhs, rhs):
-        return torch.where(condition, lhs, rhs)
-
-    def reshape(self, value, shape):
-        return value.reshape(shape)
-
-    def to_layout(self, value, layout):
-        del layout
-        return value
-
-    def typecast(self, value, *, dtype):
-        return value.to(dtype)
-
-    def to_dtype(self, value, dtype):
-        return value.to(dtype)
+import tt_thrml
+from tt_thrml import TTMLIRConfig
 
 
 class ContinuousNode(AbstractNode):
@@ -205,59 +121,37 @@ class SampleCase:
     nodes_to_sample: list[Block]
 
 
-def _reference_backend():
-    ttnn = NumpyTTNN()
-    return make_backend_binding(
-        ttnn,
-        "fake:0",
-        parameter_kernel_ops={
-            SPIN_PARAMETER_FAMILY: reference_spin_gamma_op,
-            CATEGORICAL_PARAMETER_FAMILY: reference_categorical_theta_op,
-            GAUSSIAN_PARAMETER_FAMILY: reference_gaussian_canonical_op,
-        },
-        parameter_kernel_backends={
-            SPIN_PARAMETER_FAMILY: ParameterKernelBackend.CUSTOM,
-            CATEGORICAL_PARAMETER_FAMILY: ParameterKernelBackend.CUSTOM,
-            GAUSSIAN_PARAMETER_FAMILY: ParameterKernelBackend.CUSTOM,
-        },
-    )
-
-
 def _clone_state_blocks(blocks: Sequence[object]) -> list[object]:
     return [jnp.asarray(np.asarray(block)).copy() for block in blocks]
 
 
-def _sample_states_many(case: SampleCase, *, sample_keys) -> tuple[list[np.ndarray], list[np.ndarray]]:
-    backend = _reference_backend()
-    tt_thrml.clear_compiled_program_cache()
-    try:
-        upstream_samples = []
-        tt_samples = []
-        for sample_key in sample_keys:
-            upstream_outputs = upstream_sample_states(
-                sample_key,
-                case.program,
-                case.schedule,
-                _clone_state_blocks(case.init_state_free),
-                _clone_state_blocks(case.state_clamp),
-                case.nodes_to_sample,
-            )
-            tt_outputs = tt_thrml.sample_states(
-                sample_key,
-                case.program,
-                case.schedule,
-                _clone_state_blocks(case.init_state_free),
-                _clone_state_blocks(case.state_clamp),
-                case.nodes_to_sample,
-                backend=backend,
-            )
-            upstream_samples.append(
-                [np.asarray(output) for output in upstream_outputs]
-            )
-            tt_samples.append([np.asarray(output) for output in tt_outputs])
-        return upstream_samples, tt_samples
-    finally:
-        tt_thrml.clear_compiled_program_cache()
+def _sample_states_many(
+    case: SampleCase,
+    *,
+    sample_keys,
+    executor,
+) -> tuple[list[list[np.ndarray]], list[list[np.ndarray]]]:
+    upstream_samples = []
+    tt_samples = []
+    for sample_key in sample_keys:
+        upstream_outputs = upstream_sample_states(
+            sample_key,
+            case.program,
+            case.schedule,
+            _clone_state_blocks(case.init_state_free),
+            _clone_state_blocks(case.state_clamp),
+            case.nodes_to_sample,
+        )
+        tt_outputs = executor.sample_states(
+            sample_key,
+            case.schedule,
+            case.nodes_to_sample,
+            init_state_free=_clone_state_blocks(case.init_state_free),
+            state_clamp=_clone_state_blocks(case.state_clamp),
+        )
+        upstream_samples.append([np.asarray(o) for o in upstream_outputs])
+        tt_samples.append([np.asarray(o) for o in tt_outputs])
+    return upstream_samples, tt_samples
 
 
 def _spin_state_code(samples: np.ndarray) -> np.ndarray:
@@ -548,10 +442,13 @@ def _spin_observer(state, _blocks):
     return [2 * x.astype(jnp.int8) - 1 for x in state]
 
 
-def _run_spin_scenario():
+def run_spin_scenario(ttnn, device, config: TTMLIRConfig) -> dict:
     case = _make_spin_case()
+    executor = tt_thrml.make_executor(ttnn, device, case.program, config)
     sample_keys = jax.random.split(jax.random.key(5101), 6)
-    upstream_many, tt_many = _sample_states_many(case, sample_keys=sample_keys)
+    upstream_many, tt_many = _sample_states_many(
+        case, sample_keys=sample_keys, executor=executor
+    )
     upstream_samples = _stack_output(upstream_many, 0)
     tt_samples = _stack_output(tt_many, 0)
     upstream_hist = _empirical_probs(_spin_state_code(upstream_samples), n_states=16)
@@ -567,11 +464,14 @@ def _run_spin_scenario():
     }
 
 
-def _run_categorical_scenario():
+def run_categorical_scenario(ttnn, device, config: TTMLIRConfig) -> dict:
     n_categories = 3
     case = _make_categorical_case(n_categories=n_categories)
+    executor = tt_thrml.make_executor(ttnn, device, case.program, config)
     sample_keys = jax.random.split(jax.random.key(5202), 12)
-    upstream_many, tt_many = _sample_states_many(case, sample_keys=sample_keys)
+    upstream_many, tt_many = _sample_states_many(
+        case, sample_keys=sample_keys, executor=executor
+    )
     upstream_samples = _stack_output(upstream_many, 0)
     tt_samples = _stack_output(tt_many, 0)
     upstream_hist = _empirical_probs(
@@ -584,15 +484,15 @@ def _run_categorical_scenario():
     )
     upstream_node_hist = np.stack(
         [
-            _empirical_probs(upstream_samples[:, node_index], n_states=n_categories)
-            for node_index in range(upstream_samples.shape[1])
+            _empirical_probs(upstream_samples[:, i], n_states=n_categories)
+            for i in range(upstream_samples.shape[1])
         ],
         axis=0,
     )
     tt_node_hist = np.stack(
         [
-            _empirical_probs(tt_samples[:, node_index], n_states=n_categories)
-            for node_index in range(tt_samples.shape[1])
+            _empirical_probs(tt_samples[:, i], n_states=n_categories)
+            for i in range(tt_samples.shape[1])
         ],
         axis=0,
     )
@@ -605,10 +505,13 @@ def _run_categorical_scenario():
     }
 
 
-def _run_gaussian_scenario():
+def run_gaussian_scenario(ttnn, device, config: TTMLIRConfig) -> dict:
     case = _make_gaussian_case()
+    executor = tt_thrml.make_executor(ttnn, device, case.program, config)
     sample_keys = jax.random.split(jax.random.key(5303), 6)
-    upstream_many, tt_many = _sample_states_many(case, sample_keys=sample_keys)
+    upstream_many, tt_many = _sample_states_many(
+        case, sample_keys=sample_keys, executor=executor
+    )
     upstream_samples = _stack_output(upstream_many, 0).astype(np.float64)
     tt_samples = _stack_output(tt_many, 0).astype(np.float64)
     upstream_mean, upstream_cov = _gaussian_mean_and_cov(upstream_samples)
@@ -622,11 +525,14 @@ def _run_gaussian_scenario():
     }
 
 
-def _run_mixed_scenario():
+def run_mixed_scenario(ttnn, device, config: TTMLIRConfig) -> dict:
     n_categories = 3
     case = _make_mixed_case(n_categories=n_categories)
+    executor = tt_thrml.make_executor(ttnn, device, case.program, config)
     sample_keys = jax.random.split(jax.random.key(5404), 6)
-    upstream_many, tt_many = _sample_states_many(case, sample_keys=sample_keys)
+    upstream_many, tt_many = _sample_states_many(
+        case, sample_keys=sample_keys, executor=executor
+    )
     upstream_spin = _stack_output(upstream_many, 0)
     tt_spin = _stack_output(tt_many, 0)
     upstream_cat = _stack_output(upstream_many, 1)
@@ -634,19 +540,11 @@ def _run_mixed_scenario():
     upstream_gaussian = _stack_output(upstream_many, 2).astype(np.float64)
     tt_gaussian = _stack_output(tt_many, 2).astype(np.float64)
     upstream_discrete_hist = _empirical_probs(
-        _joint_spin_categorical_code(
-            upstream_spin,
-            upstream_cat,
-            n_categories=n_categories,
-        ),
+        _joint_spin_categorical_code(upstream_spin, upstream_cat, n_categories=n_categories),
         n_states=(2 ** upstream_spin.shape[1]) * (n_categories ** upstream_cat.shape[1]),
     )
     tt_discrete_hist = _empirical_probs(
-        _joint_spin_categorical_code(
-            tt_spin,
-            tt_cat,
-            n_categories=n_categories,
-        ),
+        _joint_spin_categorical_code(tt_spin, tt_cat, n_categories=n_categories),
         n_states=(2 ** tt_spin.shape[1]) * (n_categories ** tt_cat.shape[1]),
     )
     upstream_mean, upstream_cov = _gaussian_mean_and_cov(upstream_gaussian)
@@ -661,7 +559,7 @@ def _run_mixed_scenario():
     }
 
 
-def _run_observation_clamp_scenario():
+def run_observation_clamp_scenario(ttnn, device, config: TTMLIRConfig) -> dict:
     nodes = [SpinNode() for _ in range(3)]
     free_blocks = [Block([nodes[0]]), Block([nodes[1]])]
     clamped_blocks = [Block([nodes[2]])]
@@ -693,44 +591,40 @@ def _run_observation_clamp_scenario():
         ),
         _spin_observer,
     )
+
+    executor = tt_thrml.make_executor(ttnn, device, program, config)
     sample_keys = jax.random.split(jax.random.key(5505), 4)
-    backend = _reference_backend()
-    tt_thrml.clear_compiled_program_cache()
-    try:
-        upstream_carry = None
-        tt_carry = None
-        for sample_key in sample_keys:
-            upstream_run = upstream_sample_with_observation(
-                sample_key,
-                program,
-                schedule,
-                _clone_state_blocks(init_state_free),
-                _clone_state_blocks(state_clamp),
-                observer.init(),
-                observer,
-            )[0]
-            tt_run = tt_thrml.sample_with_observation(
-                sample_key,
-                program,
-                schedule,
-                _clone_state_blocks(init_state_free),
-                _clone_state_blocks(state_clamp),
-                observer.init(),
-                observer,
-                backend=backend,
-            )[0]
-            if upstream_carry is None:
-                upstream_carry = [np.asarray(entry).copy() for entry in upstream_run]
-                tt_carry = [np.asarray(entry).copy() for entry in tt_run]
-            else:
-                for carry_index in range(len(upstream_carry)):
-                    upstream_carry[carry_index] += np.asarray(upstream_run[carry_index])
-                    tt_carry[carry_index] += np.asarray(tt_run[carry_index])
-    finally:
-        tt_thrml.clear_compiled_program_cache()
+
+    upstream_carry = None
+    tt_carry = None
+    for sample_key in sample_keys:
+        upstream_run = upstream_sample_with_observation(
+            sample_key,
+            program,
+            schedule,
+            _clone_state_blocks(init_state_free),
+            _clone_state_blocks(state_clamp),
+            observer.init(),
+            observer,
+        )[0]
+        tt_run, _ = executor.sample_with_observation(
+            sample_key,
+            schedule,
+            observer,
+            init_state_free=_clone_state_blocks(init_state_free),
+            state_clamp=_clone_state_blocks(state_clamp),
+        )
+        if upstream_carry is None:
+            upstream_carry = [np.asarray(e).copy() for e in upstream_run]
+            tt_carry = [np.asarray(e).copy() for e in tt_run]
+        else:
+            for i in range(len(upstream_carry)):
+                upstream_carry[i] += np.asarray(upstream_run[i])
+                tt_carry[i] += np.asarray(tt_run[i])
+
     total_samples = schedule.n_samples * len(sample_keys)
-    upstream_moments = [entry / total_samples for entry in upstream_carry]
-    tt_moments = [entry / total_samples for entry in tt_carry]
+    upstream_moments = [e / total_samples for e in upstream_carry]
+    tt_moments = [e / total_samples for e in tt_carry]
     return {
         "sample_count": int(total_samples),
         "diffs": {
@@ -740,15 +634,49 @@ def _run_observation_clamp_scenario():
     }
 
 
+def _require_env_path(name: str) -> Path:
+    value = os.environ.get(name)
+    if not value:
+        raise RuntimeError(f"{name} is required for parity runs.")
+    return Path(value).resolve()
+
+
+def _artifact_root() -> Path:
+    root = os.environ.get("TT_THRML_PARITY_ARTIFACT_ROOT")
+    if root:
+        return Path(root).resolve()
+    return Path("/tmp/tt-thrml-artifacts/wormhole-parity").resolve()
+
+
 def main() -> None:
-    results = {
-        "spin": _run_spin_scenario(),
-        "categorical": _run_categorical_scenario(),
-        "gaussian": _run_gaussian_scenario(),
-        "mixed": _run_mixed_scenario(),
-        "observation_clamp": _run_observation_clamp_scenario(),
-    }
-    print(json.dumps(results, sort_keys=True))
+    import ttnn
+
+    system_desc_path = _require_env_path("SYSTEM_DESC_PATH")
+    build_dir = _require_env_path("TTMLIR_BUILD_DIR")
+    artifact_root = _artifact_root()
+    artifact_root.mkdir(parents=True, exist_ok=True)
+
+    device_id_raw = os.environ.get("TT_THRML_TEST_DEVICE_IDS", "0")
+    device_id = int(device_id_raw.split(",")[0].strip() or "0")
+
+    config = tt_thrml.make_ttmlir_config(
+        system_desc_path=system_desc_path,
+        artifact_root=artifact_root,
+        build_dir=build_dir,
+    )
+
+    device = tt_thrml.open_device(ttnn, device_id=device_id)
+    try:
+        results = {
+            "spin": run_spin_scenario(ttnn, device, config),
+            "categorical": run_categorical_scenario(ttnn, device, config),
+            "gaussian": run_gaussian_scenario(ttnn, device, config),
+            "mixed": run_mixed_scenario(ttnn, device, config),
+            "observation_clamp": run_observation_clamp_scenario(ttnn, device, config),
+        }
+        print(json.dumps(results, sort_keys=True))
+    finally:
+        tt_thrml.close_device(ttnn, device)
 
 
 if __name__ == "__main__":

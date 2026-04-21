@@ -1,4 +1,4 @@
-"""TT-local sampler helpers that upstream THRML does not provide."""
+"""Conditional samplers not yet in upstream THRML."""
 
 from __future__ import annotations
 
@@ -7,21 +7,19 @@ import jax.numpy as jnp
 
 from thrml.conditional_samplers import AbstractParametricConditionalSampler
 
-from .compiler.gaussian_ops import gather_gaussian_tail_weights_jax
-from .compiler.interaction_lowering import (
-    lower_interaction_contribution,
-)
-from .runtime_config import GAUSSIAN_PARAMETER_FAMILY
-
 
 class GaussianConditional(AbstractParametricConditionalSampler):
-    """Scalar Gaussian conditional using linear and precision contributions."""
+    """Scalar Gaussian conditional using linear and precision contributions.
+
+    Interaction duck-typing:
+    - interaction.weights       -> linear contribution
+    - interaction.inverse_weights -> precision contribution (stored as variance;
+      precision = reciprocal(inverse_weights) following the convention in
+      _lower_via_gaussian_shape from the original interaction lowering)
+    """
 
     def init(self) -> None:
         return None
-
-    def tt_parameter_family(self):
-        return GAUSSIAN_PARAMETER_FAMILY
 
     def compute_parameters(
         self,
@@ -37,41 +35,28 @@ class GaussianConditional(AbstractParametricConditionalSampler):
         linear = jnp.zeros(output_sd.shape, dtype=dtype)
         precision = jnp.zeros(output_sd.shape, dtype=dtype)
 
-        for interaction, active, state in zip(
-            interactions,
-            active_flags,
-            states,
-            strict=True,
+        for interaction, active, state_slots in zip(
+            interactions, active_flags, states, strict=True
         ):
-            contribution = lower_interaction_contribution(
-                interaction,
-                parameter_family=GAUSSIAN_PARAMETER_FAMILY,
-            )
-            weights = jnp.asarray(contribution.weights, dtype=dtype)
             scale = active.astype(dtype)
-            multiplicative_states = []
-            categorical_states = []
-            for slot in state:
-                slot_array = jnp.asarray(slot)
-                if jnp.issubdtype(slot_array.dtype, jnp.integer):
-                    categorical_states.append(slot_array)
-                else:
-                    multiplicative_states.append(slot_array.astype(dtype))
-            weights = gather_gaussian_tail_weights_jax(weights, tuple(categorical_states))
-            if multiplicative_states:
-                state_prod = jnp.prod(jnp.stack(multiplicative_states, axis=-1), axis=-1)
-                scale = scale * state_prod
-            weighted = weights * scale
-            partial = jnp.sum(weighted, axis=tuple(range(1, weighted.ndim)))
-            if contribution.contribution_kind == "linear":
+            multiplicative = [
+                jnp.asarray(s).astype(dtype)
+                for s in state_slots
+                if not jnp.issubdtype(jnp.asarray(s).dtype, jnp.integer)
+            ]
+            if multiplicative:
+                scale = scale * jnp.prod(jnp.stack(multiplicative, axis=-1), axis=-1)
+
+            if hasattr(interaction, "weights"):
+                w = jnp.asarray(interaction.weights, dtype=dtype)
+                weighted = w * scale
+                partial = jnp.sum(weighted, axis=tuple(range(1, weighted.ndim)))
                 linear = linear + partial
-            elif contribution.contribution_kind == "precision":
+            elif hasattr(interaction, "inverse_weights"):
+                w = jnp.reciprocal(jnp.asarray(interaction.inverse_weights, dtype=dtype))
+                weighted = w * scale
+                partial = jnp.sum(weighted, axis=tuple(range(1, weighted.ndim)))
                 precision = precision + partial
-            else:
-                raise TypeError(
-                    "GaussianConditional only supports linear and precision "
-                    f"interaction contributions, got {contribution.contribution_kind!r}."
-                )
 
         return (linear, precision), sampler_state
 

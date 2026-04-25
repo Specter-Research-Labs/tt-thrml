@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.metadata
+
 from tests.parity._torch_stub import install_torch_stub
 
 install_torch_stub()

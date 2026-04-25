@@ -27,7 +27,10 @@ Optional environment:
   TT_THRML_USE_TRACY              Set to 1 to run pytest under `python3 -m tracy -m pytest`.
   TT_THRML_TEST_DEVICE_IDS        Passed through to the hardware test harness.
   TT_THRML_TEST_MESH_SHAPE        Passed through to the hardware test harness.
+  TT_METAL_SLOW_DISPATCH_MODE     Passed through to select slow dispatch mode.
+  TT_METAL_SKIP_ETH_CORES_WITH_RETRAIN Passed through to avoid retraining flaky ETH links.
   TT_METAL_DEVICE_PROFILER        Passed through to enable device-profiler CSV dumps.
+  TT_VISIBLE_DEVICES              Host-side fallback for selecting mounted TT devices.
 
 Examples:
   SYSTEM_DESC_PATH=/path/to/system_desc.ttsys \
@@ -73,7 +76,7 @@ fi
 container_args=(
   "${container_tool}" run --rm
   --network host
-  --cap-add ALL
+  --privileged
   -w "${repo_root}"
   -e SYSTEM_DESC_PATH="${system_desc_path}"
   -e TT_THRML_REPO_ROOT="${repo_root}"
@@ -88,7 +91,7 @@ container_args=(
   -v "$(dirname "${system_desc_path}")":"$(dirname "${system_desc_path}")${mount_suffix}"
 )
 
-for maybe_env in TT_THRML_TEST_DEVICE_IDS TT_THRML_TEST_MESH_SHAPE TT_METAL_DEVICE_PROFILER; do
+for maybe_env in TT_THRML_TEST_DEVICE_IDS TT_THRML_TEST_MESH_SHAPE TT_METAL_SLOW_DISPATCH_MODE TT_METAL_SKIP_ETH_CORES_WITH_RETRAIN TT_METAL_DEVICE_PROFILER; do
   if [[ -n "${!maybe_env:-}" ]]; then
     container_args+=(-e "${maybe_env}=${!maybe_env}")
   fi
@@ -100,7 +103,7 @@ for hugepages_path in /dev/hugepages /dev/hugepages-1G; do
   fi
 done
 
-device_ids_csv="${TT_THRML_TEST_DEVICE_IDS:-0}"
+device_ids_csv="${TT_THRML_TEST_DEVICE_IDS:-${TT_VISIBLE_DEVICES:-0}}"
 IFS=',' read -r -a device_ids <<< "${device_ids_csv}"
 for device_id in "${device_ids[@]}"; do
   trimmed_id="${device_id//[[:space:]]/}"
@@ -157,9 +160,9 @@ container_args+=(
 
     cd "${TT_THRML_REPO_ROOT}"
     if [[ "${TT_THRML_USE_TRACY:-0}" == "1" ]]; then
-      python3 -m tracy -m pytest tests/test_wormhole_smoke_perf.py "$@"
+      python3 -m tracy -m pytest tests/parity/test_wormhole_parity.py "$@"
     else
-      python3 -m pytest tests/test_wormhole_smoke_perf.py "$@"
+      python3 -m pytest tests/parity/test_wormhole_parity.py "$@"
     fi
   ' bash "$@"
 )

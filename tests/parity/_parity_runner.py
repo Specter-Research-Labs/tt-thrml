@@ -11,19 +11,16 @@ import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, cast
 
 import equinox as eqx
 import jax
 import jax.numpy as jnp
 import numpy as np
-
 from thrml.block_management import Block
-from thrml.block_sampling import (
-    BlockGibbsSpec,
-    SamplingSchedule,
-    sample_states as upstream_sample_states,
-    sample_with_observation as upstream_sample_with_observation,
-)
+from thrml.block_sampling import BlockGibbsSpec, SamplingSchedule
+from thrml.block_sampling import sample_states as upstream_sample_states
+from thrml.block_sampling import sample_with_observation as upstream_sample_with_observation
 from thrml.factor import AbstractFactor, FactorSamplingProgram
 from thrml.interaction import InteractionGroup
 from thrml.models.discrete_ebm import (
@@ -36,12 +33,12 @@ from thrml.models.discrete_ebm import (
 from thrml.observers import MomentAccumulatorObserver
 from thrml.pgm import AbstractNode, CategoricalNode, SpinNode
 
+import tt_thrml
+from tt_thrml import TTMLIRConfig
+
 # GaussianConditional is a tt-local extension not yet in upstream THRML.
 # It is used for the upstream JAX reference side of gaussian/mixed scenarios.
 from tt_thrml.conditional_samplers import GaussianConditional
-
-import tt_thrml
-from tt_thrml import TTMLIRConfig
 
 
 class ContinuousNode(AbstractNode):
@@ -116,8 +113,8 @@ class CouplingFactor(AbstractFactor):
 class SampleCase:
     program: FactorSamplingProgram
     schedule: SamplingSchedule
-    init_state_free: list[object]
-    state_clamp: list[object]
+    init_state_free: Sequence[object]
+    state_clamp: Sequence[object]
     nodes_to_sample: list[Block]
 
 
@@ -297,9 +294,7 @@ def _make_categorical_case(*, n_categories: int = 3) -> SampleCase:
 def _make_gaussian_case() -> SampleCase:
     nodes = [ContinuousNode() for _ in range(3)]
     free_blocks = [Block(nodes[0::2]), Block(nodes[1::2])]
-    node_shape_dtypes = {
-        ContinuousNode: jax.ShapeDtypeStruct(shape=(), dtype=jnp.float32)
-    }
+    node_shape_dtypes = cast(Any, {ContinuousNode: jax.ShapeDtypeStruct(shape=(), dtype=jnp.float32)})
     program = FactorSamplingProgram(
         BlockGibbsSpec(free_blocks, [], node_shape_dtypes),
         [GaussianConditional(), GaussianConditional()],
@@ -353,11 +348,14 @@ def _make_mixed_case(*, n_categories: int = 3) -> SampleCase:
             Block([continuous_nodes[1]]),
         ),
     ]
-    node_shape_dtypes = {
-        SpinNode: jax.ShapeDtypeStruct(shape=(), dtype=jnp.bool_),
-        CategoricalNode: jax.ShapeDtypeStruct(shape=(), dtype=jnp.uint8),
-        ContinuousNode: jax.ShapeDtypeStruct(shape=(), dtype=jnp.float32),
-    }
+    node_shape_dtypes = cast(
+        Any,
+        {
+            SpinNode: jax.ShapeDtypeStruct(shape=(), dtype=jnp.bool_),
+            CategoricalNode: jax.ShapeDtypeStruct(shape=(), dtype=jnp.uint8),
+            ContinuousNode: jax.ShapeDtypeStruct(shape=(), dtype=jnp.float32),
+        },
+    )
     program = FactorSamplingProgram(
         BlockGibbsSpec(free_super_blocks, [], node_shape_dtypes),
         [
@@ -446,9 +444,7 @@ def run_spin_scenario(ttnn, device, config: TTMLIRConfig) -> dict:
     case = _make_spin_case()
     executor = tt_thrml.make_executor(ttnn, device, case.program, config)
     sample_keys = jax.random.split(jax.random.key(5101), 6)
-    upstream_many, tt_many = _sample_states_many(
-        case, sample_keys=sample_keys, executor=executor
-    )
+    upstream_many, tt_many = _sample_states_many(case, sample_keys=sample_keys, executor=executor)
     upstream_samples = _stack_output(upstream_many, 0)
     tt_samples = _stack_output(tt_many, 0)
     upstream_hist = _empirical_probs(_spin_state_code(upstream_samples), n_states=16)
@@ -469,9 +465,7 @@ def run_categorical_scenario(ttnn, device, config: TTMLIRConfig) -> dict:
     case = _make_categorical_case(n_categories=n_categories)
     executor = tt_thrml.make_executor(ttnn, device, case.program, config)
     sample_keys = jax.random.split(jax.random.key(5202), 12)
-    upstream_many, tt_many = _sample_states_many(
-        case, sample_keys=sample_keys, executor=executor
-    )
+    upstream_many, tt_many = _sample_states_many(case, sample_keys=sample_keys, executor=executor)
     upstream_samples = _stack_output(upstream_many, 0)
     tt_samples = _stack_output(tt_many, 0)
     upstream_hist = _empirical_probs(
@@ -483,17 +477,11 @@ def run_categorical_scenario(ttnn, device, config: TTMLIRConfig) -> dict:
         n_states=n_categories ** tt_samples.shape[1],
     )
     upstream_node_hist = np.stack(
-        [
-            _empirical_probs(upstream_samples[:, i], n_states=n_categories)
-            for i in range(upstream_samples.shape[1])
-        ],
+        [_empirical_probs(upstream_samples[:, i], n_states=n_categories) for i in range(upstream_samples.shape[1])],
         axis=0,
     )
     tt_node_hist = np.stack(
-        [
-            _empirical_probs(tt_samples[:, i], n_states=n_categories)
-            for i in range(tt_samples.shape[1])
-        ],
+        [_empirical_probs(tt_samples[:, i], n_states=n_categories) for i in range(tt_samples.shape[1])],
         axis=0,
     )
     return {
@@ -509,9 +497,7 @@ def run_gaussian_scenario(ttnn, device, config: TTMLIRConfig) -> dict:
     case = _make_gaussian_case()
     executor = tt_thrml.make_executor(ttnn, device, case.program, config)
     sample_keys = jax.random.split(jax.random.key(5303), 6)
-    upstream_many, tt_many = _sample_states_many(
-        case, sample_keys=sample_keys, executor=executor
-    )
+    upstream_many, tt_many = _sample_states_many(case, sample_keys=sample_keys, executor=executor)
     upstream_samples = _stack_output(upstream_many, 0).astype(np.float64)
     tt_samples = _stack_output(tt_many, 0).astype(np.float64)
     upstream_mean, upstream_cov = _gaussian_mean_and_cov(upstream_samples)
@@ -530,9 +516,7 @@ def run_mixed_scenario(ttnn, device, config: TTMLIRConfig) -> dict:
     case = _make_mixed_case(n_categories=n_categories)
     executor = tt_thrml.make_executor(ttnn, device, case.program, config)
     sample_keys = jax.random.split(jax.random.key(5404), 6)
-    upstream_many, tt_many = _sample_states_many(
-        case, sample_keys=sample_keys, executor=executor
-    )
+    upstream_many, tt_many = _sample_states_many(case, sample_keys=sample_keys, executor=executor)
     upstream_spin = _stack_output(upstream_many, 0)
     tt_spin = _stack_output(tt_many, 0)
     upstream_cat = _stack_output(upstream_many, 1)
@@ -595,8 +579,8 @@ def run_observation_clamp_scenario(ttnn, device, config: TTMLIRConfig) -> dict:
     executor = tt_thrml.make_executor(ttnn, device, program, config)
     sample_keys = jax.random.split(jax.random.key(5505), 4)
 
-    upstream_carry = None
-    tt_carry = None
+    upstream_carry: list[np.ndarray] | None = None
+    tt_carry: list[np.ndarray] | None = None
     for sample_key in sample_keys:
         upstream_run = upstream_sample_with_observation(
             sample_key,
@@ -620,9 +604,12 @@ def run_observation_clamp_scenario(ttnn, device, config: TTMLIRConfig) -> dict:
         else:
             for i in range(len(upstream_carry)):
                 upstream_carry[i] += np.asarray(upstream_run[i])
+                assert tt_carry is not None
                 tt_carry[i] += np.asarray(tt_run[i])
 
     total_samples = schedule.n_samples * len(sample_keys)
+    assert upstream_carry is not None
+    assert tt_carry is not None
     upstream_moments = [e / total_samples for e in upstream_carry]
     tt_moments = [e / total_samples for e in tt_carry]
     return {
@@ -649,7 +636,7 @@ def _artifact_root() -> Path:
 
 
 def main() -> None:
-    import ttnn
+    import ttnn  # type: ignore[reportMissingImports]
 
     system_desc_path = _require_env_path("SYSTEM_DESC_PATH")
     build_dir = _require_env_path("TTMLIR_BUILD_DIR")

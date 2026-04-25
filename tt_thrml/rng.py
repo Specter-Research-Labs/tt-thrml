@@ -13,7 +13,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from .core import Family, RNGSpec, BulkRNGBuffers
+from .core import BulkRNGBuffers, Family, RNGSpec
 
 
 def make_rng_spec(blocks: tuple, n_sweeps: int) -> RNGSpec:
@@ -41,7 +41,8 @@ def make_rng_spec(blocks: tuple, n_sweeps: int) -> RNGSpec:
 
 
 def _upload(ttnn, device, arr: np.ndarray, state_dtype, layout) -> object:
-    import torch
+    import torch  # type: ignore[reportMissingImports]
+
     tensor = torch.from_numpy(arr.astype(np.float32).copy()).contiguous()
     return ttnn.from_torch(tensor, dtype=state_dtype, layout=layout, device=device)
 
@@ -57,15 +58,24 @@ def generate_bulk_rng(
 ) -> BulkRNGBuffers:
     key, spin_key, cat_key, gauss_key = jax.random.split(key, 4)
 
-    spin_logits = _generate_spin_rng(spin_key, rng_spec, ttnn, device, state_dtype, layout) if rng_spec.spin_blocks else None
-    categorical_gumbel = _generate_categorical_rng(cat_key, rng_spec, ttnn, device, state_dtype, layout) if rng_spec.categorical_blocks else None
-    gaussian_noise = _generate_gaussian_rng(gauss_key, rng_spec, ttnn, device, state_dtype, layout) if rng_spec.gaussian_blocks else None
+    spin_logits = (
+        _generate_spin_rng(spin_key, rng_spec, ttnn, device, state_dtype, layout) if rng_spec.spin_blocks else None
+    )
+    categorical_gumbel = (
+        _generate_categorical_rng(cat_key, rng_spec, ttnn, device, state_dtype, layout)
+        if rng_spec.categorical_blocks
+        else None
+    )
+    gaussian_noise = (
+        _generate_gaussian_rng(gauss_key, rng_spec, ttnn, device, state_dtype, layout)
+        if rng_spec.gaussian_blocks
+        else None
+    )
 
     return BulkRNGBuffers(
         spin_threshold_logits=spin_logits,
         categorical_gumbel=categorical_gumbel,
         gaussian_noise=gaussian_noise,
-        sweep_offset=0,
     )
 
 
@@ -187,7 +197,6 @@ def generate_bulk_rng_for_schedule(
         spin_threshold_logits=spin_result if spin_result else None,
         categorical_gumbel=cat_result if cat_result else None,
         gaussian_noise=gauss_result if gauss_result else None,
-        sweep_offset=0,
     )
 
 
@@ -199,9 +208,15 @@ def slice_rng_for_sweep(
     family: Family,
 ) -> object:
     if family == Family.SPIN:
+        if rng_buffers.spin_threshold_logits is None:
+            raise RuntimeError("Spin RNG buffer is not available.")
         return rng_buffers.spin_threshold_logits[block_index][sweep_index]
     if family == Family.CATEGORICAL:
+        if rng_buffers.categorical_gumbel is None:
+            raise RuntimeError("Categorical RNG buffer is not available.")
         return rng_buffers.categorical_gumbel[block_index][sweep_index]
     if family == Family.GAUSSIAN:
+        if rng_buffers.gaussian_noise is None:
+            raise RuntimeError("Gaussian RNG buffer is not available.")
         return rng_buffers.gaussian_noise[block_index][sweep_index]
     raise ValueError(f"Unknown family: {family}")

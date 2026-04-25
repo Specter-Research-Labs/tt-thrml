@@ -6,6 +6,8 @@ import types
 
 import numpy as np
 
+# pyright: reportAttributeAccessIssue=false
+
 
 def _coerce_array(value) -> np.ndarray:
     if isinstance(value, Tensor):
@@ -173,14 +175,10 @@ def install_torch_stub():
     torch.bool = np.bool_
 
     torch.from_numpy = lambda value: Tensor(np.array(value, copy=True))
-    torch.tensor = lambda value, dtype=None, **_: Tensor(
-        np.array(value, copy=True, dtype=dtype)
-    )
+    torch.tensor = lambda value, dtype=None, **_: Tensor(np.array(value, copy=True, dtype=dtype))
     torch.as_tensor = lambda value: Tensor(_coerce_array(value))
     torch.empty = lambda shape, dtype=np.float32: Tensor(np.empty(shape, dtype=dtype))
-    torch.empty_like = lambda value, dtype=None, **_: Tensor(
-        np.empty_like(_coerce_array(value), dtype=dtype)
-    )
+    torch.empty_like = lambda value, dtype=None, **_: Tensor(np.empty_like(_coerce_array(value), dtype=dtype))
 
     def _shape_args(shape_like):
         if isinstance(shape_like, (tuple, list)):
@@ -207,23 +205,15 @@ def install_torch_stub():
     )
     torch.arange = lambda *args, dtype=np.int64, **_: Tensor(np.arange(*args, dtype=dtype))
     torch.range = torch.arange
-    torch.linspace = lambda start, end, steps, **_: Tensor(
-        np.linspace(start, end, int(steps), dtype=np.float32)
-    )
+    torch.linspace = lambda start, end, steps, **_: Tensor(np.linspace(start, end, int(steps), dtype=np.float32))
     torch.logspace = lambda start, end, steps, base=10.0, **_: Tensor(
         np.logspace(start, end, int(steps), base=base, dtype=np.float32)
     )
-    torch.eye = lambda n, m=None, dtype=np.float32, **_: Tensor(
-        np.eye(int(n), int(n if m is None else m), dtype=dtype)
-    )
+    torch.eye = lambda n, m=None, dtype=np.float32, **_: Tensor(np.eye(int(n), int(n if m is None else m), dtype=dtype))
     torch.reshape = lambda value, shape: Tensor(np.reshape(_coerce_array(value), shape))
-    torch.concat = lambda values, dim=0: Tensor(
-        np.concatenate([_coerce_array(value) for value in values], axis=dim)
-    )
+    torch.concat = lambda values, dim=0: Tensor(np.concatenate([_coerce_array(value) for value in values], axis=dim))
     torch.cat = torch.concat
-    torch.stack = lambda values, dim=0: Tensor(
-        np.stack([_coerce_array(value) for value in values], axis=dim)
-    )
+    torch.stack = lambda values, dim=0: Tensor(np.stack([_coerce_array(value) for value in values], axis=dim))
     torch.gather = lambda values, dim, index: Tensor(
         np.take_along_axis(
             _coerce_array(values),
@@ -231,9 +221,7 @@ def install_torch_stub():
             axis=dim,
         )
     )
-    torch.sum = lambda value, dim=None, keepdim=False: Tensor(
-        np.sum(_coerce_array(value), axis=dim, keepdims=keepdim)
-    )
+    torch.sum = lambda value, dim=None, keepdim=False: Tensor(np.sum(_coerce_array(value), axis=dim, keepdims=keepdim))
     torch.where = lambda condition, lhs, rhs: Tensor(
         np.where(
             _coerce_array(condition).astype(np.bool_),
@@ -241,22 +229,18 @@ def install_torch_stub():
             _coerce_array(rhs),
         )
     )
-    torch.ones_like = lambda value, dtype=None, **_: Tensor(
-        np.ones_like(_coerce_array(value), dtype=dtype)
-    )
-    torch.zeros_like = lambda value, dtype=None, **_: Tensor(
-        np.zeros_like(_coerce_array(value), dtype=dtype)
-    )
+    torch.ones_like = lambda value, dtype=None, **_: Tensor(np.ones_like(_coerce_array(value), dtype=dtype))
+    torch.zeros_like = lambda value, dtype=None, **_: Tensor(np.zeros_like(_coerce_array(value), dtype=dtype))
     torch.rand = lambda *shape, **_: Tensor(
-        np.random.rand(
-            *(_shape_args(shape[0]) if len(shape) == 1 else tuple(int(value) for value in shape))
-        ).astype(np.float32)
+        np.random.rand(*(_shape_args(shape[0]) if len(shape) == 1 else tuple(int(value) for value in shape))).astype(
+            np.float32
+        )
     )
     torch.rand_like = lambda value, **_: Tensor(np.random.rand(*_coerce_array(value).shape).astype(np.float32))
     torch.randn = lambda *shape, **_: Tensor(
-        np.random.randn(
-            *(_shape_args(shape[0]) if len(shape) == 1 else tuple(int(value) for value in shape))
-        ).astype(np.float32)
+        np.random.randn(*(_shape_args(shape[0]) if len(shape) == 1 else tuple(int(value) for value in shape))).astype(
+            np.float32
+        )
     )
     torch.randn_like = lambda value, **_: Tensor(np.random.randn(*_coerce_array(value).shape).astype(np.float32))
     torch.randint = lambda low, high, size, dtype=np.int64, **_: Tensor(
@@ -271,9 +255,7 @@ def install_torch_stub():
         )
     )
     torch.randperm = lambda n, **_: Tensor(np.random.permutation(int(n)).astype(np.int64))
-    torch.bernoulli = lambda value, **_: Tensor(
-        np.random.binomial(1, _coerce_array(value)).astype(np.float32)
-    )
+    torch.bernoulli = lambda value, **_: Tensor(np.random.binomial(1, _coerce_array(value)).astype(np.float32))
     torch.multinomial = lambda input, num_samples, replacement=False, **_: Tensor(
         np.random.choice(
             np.arange(_coerce_array(input).shape[-1]),
@@ -288,9 +270,7 @@ def install_torch_stub():
     torch.complex = lambda real, imag, **_: Tensor(
         _coerce_array(real).astype(np.complex64) + 1j * _coerce_array(imag).astype(np.complex64)
     )
-    torch.heaviside = lambda input, values, **_: Tensor(
-        np.heaviside(_coerce_array(input), _coerce_array(values))
-    )
+    torch.heaviside = lambda input, values, **_: Tensor(np.heaviside(_coerce_array(input), _coerce_array(values)))
 
     def _argmax(value, dim=None, keepdim=False, **_):
         result = np.argmax(_coerce_array(value), axis=dim)
@@ -308,9 +288,7 @@ def install_torch_stub():
             equal_nan=equal_nan,
         )
     )
-    torch.equal = lambda lhs, rhs: bool(
-        np.array_equal(_coerce_array(lhs), _coerce_array(rhs))
-    )
+    torch.equal = lambda lhs, rhs: bool(np.array_equal(_coerce_array(lhs), _coerce_array(rhs)))
 
     def _topk(value, k, dim=-1, largest=True, sorted=True, **_):
         del sorted

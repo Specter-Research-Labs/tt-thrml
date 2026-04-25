@@ -3,7 +3,7 @@
 `tt-thrml` is the Tenstorrent execution backend for upstream [`thrml`](https://github.com/extropic-ai/thrml).
 
 Upstream `thrml` owns model authoring, blocks, samplers, and schedules. `tt-thrml` owns:
-- program compilation into fused per-block TT-MLIR kernels
+- program compilation into fused per-sampling-group TT-MLIR kernels
 - bulk RNG generation (uploaded once, consumed by offset)
 - device-resident global state across sweeps
 - observation and sample materialization back to host
@@ -32,13 +32,13 @@ Everything else should be treated as compiler/runtime internals.
 
 ## Execution Model
 
-Each THRML program is compiled once to a set of fused TT-MLIR flatbuffer kernels, one per block. A single sweep invokes each free-block kernel as:
+Each THRML program is compiled once to a set of fused TT-MLIR flatbuffer kernels, one per THRML sampling group. A single sweep invokes each group kernel as:
 
 ```
-(global_state, rng_slice) -> new_global_state
+(global_state, *rng_slices) -> new_global_state
 ```
 
-All interaction math, Gibbs sampling, and state update happen inside the flatbuffer. The host never reads state back mid-sweep.
+All interaction math, Gibbs sampling, and state update happen inside the flatbuffer. Blocks in the same THRML superblock read the same pre-group state and commit together. The host never reads state back mid-sweep.
 
 The supported parameter families are spin, categorical, and gaussian. Mixed programs built from those families are supported.
 

@@ -2,12 +2,11 @@ from __future__ import annotations
 
 import json
 import os
-from pathlib import Path
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
-
 
 pytestmark = [pytest.mark.hardware, pytest.mark.slow]
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -21,10 +20,7 @@ def _extract_json_payload(stdout: str) -> dict:
         if not (payload.startswith("{") and payload.endswith("}")):
             continue
         return json.loads(payload)
-    raise AssertionError(
-        "parity runner did not emit a JSON payload.\n"
-        f"stdout:\n{stdout}"
-    )
+    raise AssertionError("parity runner did not emit a JSON payload.\n" f"stdout:\n{stdout}")
 
 
 @pytest.fixture(scope="module")
@@ -44,16 +40,10 @@ def wormhole_parity_results():
         )
     except subprocess.TimeoutExpired as exc:
         raise AssertionError(
-            "parity runner timed out.\n"
-            f"stdout:\n{exc.stdout or ''}\n"
-            f"stderr:\n{exc.stderr or ''}"
+            "parity runner timed out.\n" f"stdout:\n{exc.stdout or ''}\n" f"stderr:\n{exc.stderr or ''}"
         ) from exc
     if completed.returncode != 0:
-        raise AssertionError(
-            "parity runner failed.\n"
-            f"stdout:\n{completed.stdout}\n"
-            f"stderr:\n{completed.stderr}"
-        )
+        raise AssertionError("parity runner failed.\n" f"stdout:\n{completed.stdout}\n" f"stderr:\n{completed.stderr}")
     return _extract_json_payload(completed.stdout)
 
 

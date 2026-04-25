@@ -64,6 +64,7 @@ reportUnnecessaryTypeIgnoreComment = true
 include = ["tt_thrml", "tests"]
 
 [tool.pytest.ini_options]
+testpaths = ["tests"]
 markers = [
     "hardware: marks tests that require TT hardware (deselect with '-m \"not hardware\"')",
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",

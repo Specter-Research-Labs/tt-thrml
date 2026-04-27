@@ -42,6 +42,45 @@ All interaction math, Gibbs sampling, and state update happen inside the flatbuf
 
 The supported parameter families are spin, categorical, and gaussian. Mixed programs built from those families are supported.
 
+## TT-Lang Direction
+
+The TT-Lang backend work uses a different internal state contract from the
+current TT-MLIR path. Host-facing THRML state stays the same, but
+device-resident state is lowered into family-specific lanes:
+
+- spin: one signed lane per node
+- categorical: one one-hot lane per category per node
+- gaussian: one value lane per node
+
+This keeps categorical source selection as direct tiled arithmetic
+(`one_hot * weights`) instead of scalar category-id gather logic. The initial
+layout and conversion primitives live in `tt_thrml.ttlang_backend`.
+
+The first hardware runner is:
+
+```bash
+python scripts/run_ttlang_spin_categorical_plan.py
+```
+
+It lowers the mixed parity program's first spin block into a TT-Lang
+spin/categorical-source plan and executes it with TT-Lang on Wormhole. The
+validated dispatch job was:
+
+```text
+j-quietbox-ttlang-thrml-plan-hw-strict-hi246h
+```
+
+One detail matters for the final executor: `ttl.math.sign(0)` returns `0`,
+while THRML's spin update uses a strict `>` decision whose tie result is the
+negative spin. The runner encodes the strict decision as
+`sign(sign(x) - 0.5)`, avoiding `where` while preserving THRML tie behavior.
+
+Before making TT-Lang the default backend, compare it against the current
+TT-MLIR/TTRT backend on the same Wormhole for spin-only, categorical-only, and
+mixed workloads, measuring compile time, first-sweep latency, steady-state
+milliseconds per sweep, dispatch count, transfer count, and parity against the
+CPU sampler.
+
 ## Install
 
 ```bash

@@ -1,0 +1,258 @@
+"""TT-Lang-oriented state layout for THRML programs.
+
+The existing TT-MLIR backend stores every THRML node in a flat scalar vector.
+That shape is convenient for StableHLO gather/update lowering, but it is the
+wrong device contract for TT-Lang categorical work. TT-Lang wants the data
+already laid out as tiled arithmetic operands.
+
+This module defines the backend-facing logical layout:
+
+- spin blocks store one signed lane per node
+- categorical blocks store one one-hot lane per category per node
+- gaussian blocks store one value lane per node
+
+The host-facing THRML API can keep using booleans, scalar category ids, and
+floats. Only the device-resident backend state changes shape.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Iterable, Sequence
+
+import numpy as np
+
+from .core import CompiledFusedBlock, Family, FusedBlockSpec
+
+
+@dataclass(frozen=True)
+class TTLangBlockLayout:
+    block_index: int
+    family: Family
+    n_nodes: int
+    n_categories: int | None
+    scalar_start: int
+    lane_start: int
+    lanes_per_node: int
+
+    @property
+    def lane_count(self) -> int:
+        return self.n_nodes * self.lanes_per_node
+
+
+@dataclass(frozen=True)
+class TTLangStateLayout:
+    blocks: tuple[TTLangBlockLayout, ...]
+    total_lanes: int
+    scalar_to_lane_start: tuple[int, ...]
+
+    def block(self, block_index: int) -> TTLangBlockLayout:
+        return self.blocks[block_index]
+
+    def node_lane_start(self, scalar_global_index: int) -> int:
+        return self.scalar_to_lane_start[scalar_global_index]
+
+
+@dataclass(frozen=True)
+class TTLangSpinCategoricalPlan:
+    """A first TT-Lang-lowerable spin block shape.
+
+    The block has one spin node and zero or more categorical source
+    contributions. Bias terms are pre-summed on the host as constants. Each
+    categorical source contribution is represented as three category lanes and
+    three corresponding weights for the target spin node.
+    """
+
+    block_index: int
+    output_lane: int
+    bias: float
+    categorical_lane_groups: tuple[tuple[int, ...], ...]
+    categorical_weights: tuple[tuple[float, ...], ...]
+
+    @property
+    def n_categorical_terms(self) -> int:
+        return len(self.categorical_lane_groups)
+
+
+def _as_spec(block_or_spec: CompiledFusedBlock | FusedBlockSpec) -> FusedBlockSpec:
+    return block_or_spec.spec if isinstance(block_or_spec, CompiledFusedBlock) else block_or_spec
+
+
+def build_ttlang_state_layout(blocks: Sequence[CompiledFusedBlock | FusedBlockSpec]) -> TTLangStateLayout:
+    """Build the family-specific logical TT-Lang state layout for compiled blocks."""
+    layouts: list[TTLangBlockLayout] = []
+    scalar_to_lane: list[int | None] = []
+    lane_start = 0
+
+    for block_or_spec in blocks:
+        spec = _as_spec(block_or_spec)
+        lanes_per_node = spec.n_categories if spec.family == Family.CATEGORICAL else 1
+        if lanes_per_node is None:
+            raise ValueError(f"categorical block {spec.block_index} is missing n_categories")
+
+        block_layout = TTLangBlockLayout(
+            block_index=spec.block_index,
+            family=spec.family,
+            n_nodes=spec.n_nodes,
+            n_categories=spec.n_categories,
+            scalar_start=spec.block_global_start,
+            lane_start=lane_start,
+            lanes_per_node=int(lanes_per_node),
+        )
+        layouts.append(block_layout)
+
+        needed = spec.block_global_start + spec.n_nodes
+        if len(scalar_to_lane) < needed:
+            scalar_to_lane.extend([None] * (needed - len(scalar_to_lane)))
+        for node_offset in range(spec.n_nodes):
+            scalar_to_lane[spec.block_global_start + node_offset] = (
+                lane_start + node_offset * block_layout.lanes_per_node
+            )
+
+        lane_start += block_layout.lane_count
+
+    if any(value is None for value in scalar_to_lane):
+        raise ValueError("compiled scalar state has holes; cannot build TT-Lang layout")
+
+    return TTLangStateLayout(
+        blocks=tuple(layouts),
+        total_lanes=lane_start,
+        scalar_to_lane_start=tuple(int(value) for value in scalar_to_lane if value is not None),
+    )
+
+
+def encode_block_state(layout: TTLangBlockLayout, state) -> np.ndarray:
+    """Encode one THRML block state into backend lanes."""
+    arr = np.asarray(state)
+    if layout.family == Family.SPIN:
+        return np.where(arr.astype(np.float32) > 0, 1.0, -1.0).reshape(layout.n_nodes)
+    if layout.family == Family.CATEGORICAL:
+        n_categories = layout.n_categories
+        if n_categories is None:
+            raise ValueError("categorical layout is missing n_categories")
+        ids = arr.astype(np.int64).reshape(layout.n_nodes)
+        if np.any((ids < 0) | (ids >= n_categories)):
+            raise ValueError(f"categorical state contains ids outside [0, {n_categories})")
+        return np.eye(n_categories, dtype=np.float32)[ids].reshape(layout.lane_count)
+    return arr.astype(np.float32).reshape(layout.n_nodes)
+
+
+def decode_block_state(layout: TTLangBlockLayout, lanes: np.ndarray) -> np.ndarray:
+    """Decode one backend lane chunk back into THRML's host-facing state."""
+    chunk = np.asarray(lanes, dtype=np.float32)
+    if layout.family == Family.SPIN:
+        return (chunk.reshape(layout.n_nodes) > 0).astype(bool)
+    if layout.family == Family.CATEGORICAL:
+        return chunk.reshape(layout.n_nodes, layout.lanes_per_node).argmax(axis=1).astype(np.int32)
+    return chunk.reshape(layout.n_nodes).astype(np.float32)
+
+
+def encode_state(layout: TTLangStateLayout, block_states: Sequence[object]) -> np.ndarray:
+    """Encode all block states into one TT-Lang backend state vector."""
+    if len(block_states) != len(layout.blocks):
+        raise ValueError(f"expected {len(layout.blocks)} block states, got {len(block_states)}")
+    lanes = np.empty(layout.total_lanes, dtype=np.float32)
+    for block_layout, state in zip(layout.blocks, block_states, strict=True):
+        start = block_layout.lane_start
+        lanes[start : start + block_layout.lane_count] = encode_block_state(block_layout, state)
+    return lanes
+
+
+def decode_state(layout: TTLangStateLayout, lanes: np.ndarray) -> list[np.ndarray]:
+    """Decode a complete TT-Lang backend state vector into THRML block states."""
+    flat = np.asarray(lanes, dtype=np.float32).reshape(-1)
+    if flat.shape[0] != layout.total_lanes:
+        raise ValueError(f"expected {layout.total_lanes} lanes, got {flat.shape[0]}")
+    result = []
+    for block_layout in layout.blocks:
+        start = block_layout.lane_start
+        result.append(decode_block_state(block_layout, flat[start : start + block_layout.lane_count]))
+    return result
+
+
+def categorical_source_lanes(
+    layout: TTLangStateLayout, scalar_global_indices: Iterable[int], n_categories: int
+) -> np.ndarray:
+    """Return lane indices for categorical source nodes as (n_sources, n_categories)."""
+    starts = [layout.node_lane_start(int(index)) for index in scalar_global_indices]
+    offsets = np.arange(n_categories, dtype=np.int32)
+    return np.asarray(starts, dtype=np.int32)[:, None] + offsets[None, :]
+
+
+def expand_categorical_gather_lanes(
+    layout: TTLangStateLayout,
+    scalar_gather_indices: np.ndarray,
+    n_categories: int,
+) -> np.ndarray:
+    """Expand scalar categorical gather indices to one-hot category lane indices.
+
+    The current TT-MLIR lowering gathers a scalar category id and then uses it
+    to select a weight slice. TT-Lang kernels should instead gather all category
+    lanes and compute `one_hot * weights` directly.
+    """
+    gather = np.asarray(scalar_gather_indices, dtype=np.int32)
+    expanded = categorical_source_lanes(layout, gather.reshape(-1), n_categories)
+    return expanded.reshape(gather.shape + (n_categories,))
+
+
+def build_spin_categorical_plan(layout: TTLangStateLayout, spec: FusedBlockSpec) -> TTLangSpinCategoricalPlan:
+    """Lower a simple spin block to a TT-Lang categorical-source plan.
+
+    This intentionally accepts only the first production shape proven by the
+    TT-Lang spikes: one spin node, scalar/bias terms, and categorical source
+    terms represented as category planes. Unsupported interaction structure
+    raises clearly so callers can fall back to the existing TT-MLIR backend.
+    """
+    if spec.family != Family.SPIN:
+        raise ValueError(f"expected spin block, got {spec.family.value}")
+    if spec.n_nodes != 1:
+        raise ValueError("TT-Lang spin categorical plan currently supports one-node spin blocks")
+
+    bias = 0.0
+    lane_groups: list[tuple[int, ...]] = []
+    weight_groups: list[tuple[float, ...]] = []
+
+    for interaction in spec.interactions:
+        weighted_mask = np.asarray(interaction.weighted_mask, dtype=np.float32)
+        if interaction.n_spin:
+            raise ValueError("spin source interactions are not yet supported by this TT-Lang plan")
+        if interaction.n_categorical == 0:
+            bias += float(weighted_mask.sum())
+            continue
+        if interaction.n_categorical != 1:
+            raise ValueError("only one categorical source per interaction is currently supported")
+        if weighted_mask.shape[0] != 1 or weighted_mask.shape[1] != interaction.n_terms:
+            raise ValueError("unexpected spin categorical weight shape")
+        if len(interaction.gather_indices) != 1:
+            raise ValueError("categorical interaction must have exactly one gather index array")
+
+        n_categories = int(weighted_mask.shape[2])
+        gather_indices = np.asarray(interaction.gather_indices[0], dtype=np.int32)
+        expanded_lanes = expand_categorical_gather_lanes(layout, gather_indices, n_categories)
+        weights = weighted_mask.reshape(interaction.n_terms, n_categories)
+        lanes = expanded_lanes.reshape(interaction.n_terms, n_categories)
+        for term_lanes, term_weights in zip(lanes, weights, strict=True):
+            lane_groups.append(tuple(int(v) for v in term_lanes))
+            weight_groups.append(tuple(float(v) for v in term_weights))
+
+    output_lane = layout.node_lane_start(spec.block_global_start)
+    return TTLangSpinCategoricalPlan(
+        block_index=spec.block_index,
+        output_lane=output_lane,
+        bias=bias,
+        categorical_lane_groups=tuple(lane_groups),
+        categorical_weights=tuple(weight_groups),
+    )
+
+
+def evaluate_spin_categorical_plan(
+    plan: TTLangSpinCategoricalPlan, state_lanes: np.ndarray, threshold_logit: float
+) -> float:
+    """Reference evaluator for the first TT-Lang spin categorical plan."""
+    lanes = np.asarray(state_lanes, dtype=np.float32).reshape(-1)
+    gamma = plan.bias
+    for lane_group, weight_group in zip(plan.categorical_lane_groups, plan.categorical_weights, strict=True):
+        gamma += float(
+            np.dot(lanes[np.asarray(lane_group, dtype=np.int32)], np.asarray(weight_group, dtype=np.float32))
+        )
+    return 1.0 if (2.0 * gamma) > float(threshold_logit) else -1.0

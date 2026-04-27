@@ -21,7 +21,7 @@ import torch
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
-from tests.parity._parity_runner import _make_mixed_case
+from tt_thrml.example_programs import make_mixed_spin_categorical_gaussian_program
 from tt_thrml.ttlang_backend import ExperimentalTTLangExecutor, TTLangSpinCategoricalRun
 
 TILE = 32
@@ -157,7 +157,7 @@ def _run_case(device, run: TTLangSpinCategoricalRun) -> None:
 
 
 def main() -> None:
-    executor = ExperimentalTTLangExecutor(_make_mixed_case().program)
+    executor = ExperimentalTTLangExecutor(make_mixed_spin_categorical_gaussian_program())
 
     device = ttnn.open_device(device_id=0)
     try:

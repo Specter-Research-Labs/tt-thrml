@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import numpy as np
 
-from tests.parity._parity_runner import _make_mixed_case
 from tt_thrml.core import Family
+from tt_thrml.example_programs import make_mixed_spin_categorical_gaussian_program
 from tt_thrml.ttlang_backend import (
     ExperimentalTTLangExecutor,
     build_categorical_spin_plan,
@@ -20,7 +20,7 @@ from tt_thrml.ttlang_backend import (
 
 
 def test_ttlang_state_layout_expands_categorical_blocks_to_one_hot_lanes():
-    compiled_blocks = build_ttlang_compiled_blocks(_make_mixed_case().program)
+    compiled_blocks = build_ttlang_compiled_blocks(make_mixed_spin_categorical_gaussian_program())
     layout = build_ttlang_state_layout(compiled_blocks)
 
     assert [block.family for block in layout.blocks] == [
@@ -37,7 +37,7 @@ def test_ttlang_state_layout_expands_categorical_blocks_to_one_hot_lanes():
 
 
 def test_ttlang_state_round_trips_thrml_host_shapes():
-    compiled_blocks = build_ttlang_compiled_blocks(_make_mixed_case().program)
+    compiled_blocks = build_ttlang_compiled_blocks(make_mixed_spin_categorical_gaussian_program())
     layout = build_ttlang_state_layout(compiled_blocks)
     states = [
         np.asarray([True]),
@@ -64,14 +64,14 @@ def test_ttlang_state_round_trips_thrml_host_shapes():
 
 
 def test_ttlang_categorical_source_lanes_address_all_category_planes():
-    compiled_blocks = build_ttlang_compiled_blocks(_make_mixed_case().program)
+    compiled_blocks = build_ttlang_compiled_blocks(make_mixed_spin_categorical_gaussian_program())
     layout = build_ttlang_state_layout(compiled_blocks)
 
     np.testing.assert_array_equal(categorical_source_lanes(layout, [1, 4], 3), np.asarray([[1, 2, 3], [6, 7, 8]]))
 
 
 def test_ttlang_expands_mixed_program_categorical_gather_to_one_hot_lanes():
-    compiled_blocks = build_ttlang_compiled_blocks(_make_mixed_case().program)
+    compiled_blocks = build_ttlang_compiled_blocks(make_mixed_spin_categorical_gaussian_program())
     layout = build_ttlang_state_layout(compiled_blocks)
 
     first_spin = compiled_blocks[0].spec
@@ -87,7 +87,7 @@ def test_ttlang_expands_mixed_program_categorical_gather_to_one_hot_lanes():
 
 
 def test_ttlang_builds_spin_categorical_plan_from_mixed_program_spec():
-    compiled_blocks = build_ttlang_compiled_blocks(_make_mixed_case().program)
+    compiled_blocks = build_ttlang_compiled_blocks(make_mixed_spin_categorical_gaussian_program())
     layout = build_ttlang_state_layout(compiled_blocks)
     plan = build_spin_categorical_plan(layout, compiled_blocks[0].spec)
 
@@ -125,7 +125,7 @@ def test_ttlang_builds_spin_categorical_plan_from_mixed_program_spec():
 
 
 def test_experimental_ttlang_executor_materializes_supported_spin_plan():
-    executor = ExperimentalTTLangExecutor(_make_mixed_case().program)
+    executor = ExperimentalTTLangExecutor(make_mixed_spin_categorical_gaussian_program())
 
     assert len(executor.spin_categorical_plans) == 2
 
@@ -149,7 +149,7 @@ def test_experimental_ttlang_executor_materializes_supported_spin_plan():
 
 
 def test_ttlang_builds_categorical_spin_plan_from_mixed_program_spec():
-    compiled_blocks = build_ttlang_compiled_blocks(_make_mixed_case().program)
+    compiled_blocks = build_ttlang_compiled_blocks(make_mixed_spin_categorical_gaussian_program())
     layout = build_ttlang_state_layout(compiled_blocks)
     plan = build_categorical_spin_plan(layout, compiled_blocks[1].spec)
 
@@ -176,7 +176,7 @@ def test_ttlang_builds_categorical_spin_plan_from_mixed_program_spec():
 
 
 def test_experimental_ttlang_executor_materializes_supported_categorical_plan():
-    executor = ExperimentalTTLangExecutor(_make_mixed_case().program)
+    executor = ExperimentalTTLangExecutor(make_mixed_spin_categorical_gaussian_program())
 
     assert len(executor.categorical_spin_plans) == 2
 

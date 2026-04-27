@@ -56,18 +56,24 @@ This keeps categorical source selection as direct tiled arithmetic
 (`one_hot * weights`) instead of scalar category-id gather logic. The initial
 layout and conversion primitives live in `tt_thrml.ttlang_backend`.
 
-The first hardware runner is:
+The first hardware runners are:
 
 ```bash
 python scripts/run_ttlang_spin_categorical_plan.py
+python scripts/run_ttlang_categorical_spin_plan.py
 ```
 
-It lowers the mixed parity program's first spin block into a TT-Lang
-spin/categorical-source plan and executes it with TT-Lang on Wormhole. The
-validated dispatch job was:
+They lower the shared mixed spin/categorical/gaussian smoke program into the
+first two TT-Lang plan shapes:
+
+- spin target from one-hot categorical source lanes
+- categorical target from signed spin source lanes
+
+The validated dispatch jobs were:
 
 ```text
-j-quietbox-ttlang-thrml-executor-shell-hw-hihsvc
+j-quietbox-ttlang-spin-categorical-plan-hw-shared-program-hj4zsy
+j-quietbox-ttlang-categorical-spin-plan-hw-scorebuf-hj4hzj
 ```
 
 One detail matters for the final executor: `ttl.math.sign(0)` returns `0`,

@@ -62,6 +62,7 @@ The first hardware runners are:
 python scripts/run_ttlang_spin_categorical_plan.py
 python scripts/run_ttlang_categorical_spin_plan.py
 python scripts/run_ttlang_discrete_sweep.py
+python scripts/run_ttlang_discrete_sweep.py --benchmark 50
 ```
 
 They lower the shared mixed spin/categorical/gaussian smoke program into the
@@ -78,7 +79,12 @@ The validated dispatch jobs were:
 j-quietbox-ttlang-spin-categorical-plan-hw-shared-program-hj4zsy
 j-quietbox-ttlang-categorical-spin-plan-hw-scorebuf-hj4hzj
 j-quietbox-ttlang-discrete-sweep-hw-copy3-hjmuox
+j-quietbox-ttlang-discrete-sweep-bench-50-hjvh1e
 ```
+
+The 50-sweep TT-Lang benchmark job measured 32.54 ms total, or 0.651
+ms/sweep, for the current narrow implementation. It still uses six dispatches
+per sweep, so this is a baseline before fusing group copy/update work.
 
 One detail matters for the final executor: `ttl.math.sign(0)` returns `0`,
 while THRML's spin update uses a strict `>` decision whose tie result is the

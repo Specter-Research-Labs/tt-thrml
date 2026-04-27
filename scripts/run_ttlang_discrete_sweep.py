@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import argparse
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -63,7 +65,7 @@ def copy_state_10(inp, out):
                 tx_out.wait()
 
 
-def _define_spin_update(name: str, source_start: int, output_lane: int):
+def _define_spin_update(source_start: int, output_lane: int):
     @ttl.operation(grid=(1, 1))
     def spin_update(state, weights, bias, threshold_logits, half, out):
         cat_state_dfb = ttl.make_dataflow_buffer_like(state, shape=(1, 1), block_count=2)
@@ -112,7 +114,7 @@ def _define_spin_update(name: str, source_start: int, output_lane: int):
     return spin_update
 
 
-def _define_categorical_update(name: str, source_lane: int, output_start: int):
+def _define_categorical_update(source_lane: int, output_start: int):
     @ttl.operation(grid=(1, 1))
     def categorical_update(state, weights, bias, gumbel, one, half, out):
         spin_dfb = ttl.make_dataflow_buffer_like(state, shape=(1, 1), block_count=2)
@@ -205,10 +207,10 @@ def _define_categorical_update(name: str, source_lane: int, output_start: int):
     return categorical_update
 
 
-spin_group0 = _define_spin_update("thrml_spin_group0", source_start=1, output_lane=0)
-categorical_group0 = _define_categorical_update("thrml_categorical_group0", source_lane=0, output_start=1)
-spin_group1 = _define_spin_update("thrml_spin_group1", source_start=6, output_lane=5)
-categorical_group1 = _define_categorical_update("thrml_categorical_group1", source_lane=5, output_start=6)
+spin_group0 = _define_spin_update(source_start=1, output_lane=0)
+categorical_group0 = _define_categorical_update(source_lane=0, output_start=1)
+spin_group1 = _define_spin_update(source_start=6, output_lane=5)
+categorical_group1 = _define_categorical_update(source_lane=5, output_start=6)
 
 
 def _tile_planes(values: list[float]) -> torch.Tensor:
@@ -231,7 +233,69 @@ def _initial_state() -> list[np.ndarray]:
     ]
 
 
+def _run_discrete_sweep(state_in, state_mid, state_out, constants) -> None:
+    copy_state_10(state_in, state_mid)
+    spin_group0(
+        state_in,
+        constants["spin0_weights"],
+        constants["spin0_bias"],
+        constants["threshold"],
+        constants["half"],
+        state_mid,
+    )
+    categorical_group0(
+        state_in,
+        constants["cat0_weights"],
+        constants["cat0_bias"],
+        constants["gumbel0"],
+        constants["one"],
+        constants["half"],
+        state_mid,
+    )
+
+    copy_state_10(state_mid, state_out)
+    spin_group1(
+        state_mid,
+        constants["spin1_weights"],
+        constants["spin1_bias"],
+        constants["threshold"],
+        constants["half"],
+        state_out,
+    )
+    categorical_group1(
+        state_mid,
+        constants["cat1_weights"],
+        constants["cat1_bias"],
+        constants["gumbel1"],
+        constants["one"],
+        constants["half"],
+        state_out,
+    )
+
+
+def _make_constants(device, spin_plans, categorical_plans) -> dict:
+    return {
+        "one": from_torch(torch.ones((TILE, TILE), dtype=torch.bfloat16), device=device),
+        "half": from_torch(torch.full((TILE, TILE), 0.5, dtype=torch.bfloat16), device=device),
+        "threshold": from_torch(torch.zeros((TILE, TILE), dtype=torch.bfloat16), device=device),
+        "gumbel0": from_torch(torch.zeros((N_CATEGORIES * TILE, TILE), dtype=torch.bfloat16), device=device),
+        "gumbel1": from_torch(torch.zeros((N_CATEGORIES * TILE, TILE), dtype=torch.bfloat16), device=device),
+        "spin0_weights": from_torch(_tile_planes(list(spin_plans[0].categorical_weights[0])), device=device),
+        "spin0_bias": from_torch(torch.full((TILE, TILE), spin_plans[0].bias, dtype=torch.bfloat16), device=device),
+        "cat0_weights": from_torch(_tile_planes(list(categorical_plans[1].spin_weights[0])), device=device),
+        "cat0_bias": from_torch(_tile_planes(list(categorical_plans[1].bias)), device=device),
+        "spin1_weights": from_torch(_tile_planes(list(spin_plans[3].categorical_weights[0])), device=device),
+        "spin1_bias": from_torch(torch.full((TILE, TILE), spin_plans[3].bias, dtype=torch.bfloat16), device=device),
+        "cat1_weights": from_torch(_tile_planes(list(categorical_plans[4].spin_weights[0])), device=device),
+        "cat1_bias": from_torch(_tile_planes(list(categorical_plans[4].bias)), device=device),
+    }
+
+
 def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--benchmark", type=int, default=0, metavar="N", help="run N timed device-resident sweeps")
+    args = parser.parse_args()
+
     executor = ExperimentalTTLangExecutor(make_mixed_spin_categorical_gaussian_program())
     initial_lanes = executor.encode_state(_initial_state())
     expected_lanes = executor.evaluate_discrete_sweep(
@@ -247,49 +311,9 @@ def main() -> None:
         state0 = from_torch(_state_tiles(initial_lanes), device=device)
         state1 = from_torch(torch.zeros((N_LANES * TILE, TILE), dtype=torch.bfloat16), device=device)
         state2 = from_torch(torch.zeros((N_LANES * TILE, TILE), dtype=torch.bfloat16), device=device)
-        one = from_torch(torch.ones((TILE, TILE), dtype=torch.bfloat16), device=device)
-        half = from_torch(torch.full((TILE, TILE), 0.5, dtype=torch.bfloat16), device=device)
-        threshold = from_torch(torch.zeros((TILE, TILE), dtype=torch.bfloat16), device=device)
-        gumbel0 = from_torch(torch.zeros((N_CATEGORIES * TILE, TILE), dtype=torch.bfloat16), device=device)
-        gumbel1 = from_torch(torch.zeros((N_CATEGORIES * TILE, TILE), dtype=torch.bfloat16), device=device)
+        constants = _make_constants(device, spin_plans, categorical_plans)
 
-        copy_state_10(state0, state1)
-        spin_group0(
-            state0,
-            from_torch(_tile_planes(list(spin_plans[0].categorical_weights[0])), device=device),
-            from_torch(torch.full((TILE, TILE), spin_plans[0].bias, dtype=torch.bfloat16), device=device),
-            threshold,
-            half,
-            state1,
-        )
-        categorical_group0(
-            state0,
-            from_torch(_tile_planes(list(categorical_plans[1].spin_weights[0])), device=device),
-            from_torch(_tile_planes(list(categorical_plans[1].bias)), device=device),
-            gumbel0,
-            one,
-            half,
-            state1,
-        )
-
-        copy_state_10(state1, state2)
-        spin_group1(
-            state1,
-            from_torch(_tile_planes(list(spin_plans[3].categorical_weights[0])), device=device),
-            from_torch(torch.full((TILE, TILE), spin_plans[3].bias, dtype=torch.bfloat16), device=device),
-            threshold,
-            half,
-            state2,
-        )
-        categorical_group1(
-            state1,
-            from_torch(_tile_planes(list(categorical_plans[4].spin_weights[0])), device=device),
-            from_torch(_tile_planes(list(categorical_plans[4].bias)), device=device),
-            gumbel1,
-            one,
-            half,
-            state2,
-        )
+        _run_discrete_sweep(state0, state1, state2, constants)
 
         result = ttnn.to_torch(state2).to(torch.bfloat16)
         expected = _state_tiles(expected_lanes)
@@ -304,6 +328,28 @@ def main() -> None:
             )
             raise AssertionError("TT-Lang discrete sweep mismatch")
         print("PASS: TT-Lang THRML discrete sweep")
+
+        if args.benchmark:
+            n = int(args.benchmark)
+            if n <= 0:
+                raise ValueError("--benchmark must be positive")
+            ttnn.synchronize_device(device)
+            t0 = time.perf_counter()
+            src, mid, dst = state2, state1, state0
+            for _ in range(n):
+                _run_discrete_sweep(src, mid, dst, constants)
+                src, dst = dst, src
+            ttnn.synchronize_device(device)
+            elapsed_ms = (time.perf_counter() - t0) * 1000.0
+            print(
+                "benchmark",
+                {
+                    "sweeps": n,
+                    "total_ms": elapsed_ms,
+                    "ms_per_sweep": elapsed_ms / n,
+                    "dispatches_per_sweep": 6,
+                },
+            )
     finally:
         ttnn.close_device(device)
 

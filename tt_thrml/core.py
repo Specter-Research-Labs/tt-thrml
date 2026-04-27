@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from enum import Enum
 import hashlib
 import json
 import os
-from pathlib import Path
 import tempfile
-from typing import Sequence
+from dataclasses import dataclass
+from enum import Enum
+from pathlib import Path
+from typing import Any, Iterable, Sequence, cast
 
 
 class Family(str, Enum):
@@ -22,8 +22,8 @@ class Family(str, Enum):
 class TTMLIRConfig:
     system_desc_path: Path
     artifact_root: Path
-    ttmlir_opt: str
-    ttmlir_translate: str
+    ttmlir_opt: str | Path
+    ttmlir_translate: str | Path
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "system_desc_path", Path(self.system_desc_path).resolve())
@@ -34,8 +34,8 @@ class TTMLIRConfig:
     def cache_key(self) -> str:
         payload = {
             "system_desc_path": str(self.system_desc_path),
-            "ttmlir_opt": self.ttmlir_opt,
-            "ttmlir_translate": self.ttmlir_translate,
+            "ttmlir_opt": str(self.ttmlir_opt),
+            "ttmlir_translate": str(self.ttmlir_translate),
         }
         return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:16]
 
@@ -46,12 +46,13 @@ class FusedInteractionSpec:
 
     weighted_mask is the elementwise product weights*active_mask, pre-folded so the
     kernel materializes only one constant per interaction. gather_indices is a tuple
-    with one (n_nodes, n_terms) index array per source spin of the interaction
-    (empty for bias-only interactions).
+    with one flat-global (n_nodes, n_terms) index array per source of the interaction.
     """
+
     weighted_mask: object
     gather_indices: tuple[object, ...]
     n_spin: int
+    n_categorical: int
     n_terms: int
     contribution_kind: str
 
@@ -59,6 +60,7 @@ class FusedInteractionSpec:
 @dataclass(frozen=True)
 class FusedBlockSpec:
     """Specification for a fused block kernel."""
+
     block_index: int
     family: Family
     n_nodes: int
@@ -71,14 +73,25 @@ class FusedBlockSpec:
 @dataclass(frozen=True)
 class CompiledFusedBlock:
     """Compiled fused kernel for one block."""
+
     spec: FusedBlockSpec
-    kernel_artifact: object
+    kernel_artifact: Path | None
+
+
+@dataclass(frozen=True)
+class CompiledSamplingGroup:
+    """Compiled fused kernel for one THRML sampling group."""
+
+    block_indices: tuple[int, ...]
+    kernel_artifact: Path
 
 
 @dataclass(frozen=True)
 class CompiledProgram:
     """Compiled THRML program with fused kernels."""
+
     blocks: tuple[CompiledFusedBlock, ...]
+    sampling_groups: tuple[CompiledSamplingGroup, ...]
     n_free_blocks: int
     total_nodes: int
     block_global_starts: tuple[int, ...]
@@ -92,6 +105,7 @@ class CompiledProgram:
 @dataclass(frozen=True)
 class RNGSpec:
     """Specification for bulk RNG buffers."""
+
     n_sweeps: int
     spin_blocks: tuple[int, ...]
     categorical_blocks: tuple[int, ...]
@@ -103,10 +117,10 @@ class RNGSpec:
 @dataclass(frozen=True)
 class BulkRNGBuffers:
     """Pre-generated RNG buffers on device."""
-    spin_threshold_logits: object | None
-    categorical_gumbel: object | None
-    gaussian_noise: object | None
-    sweep_offset: int = 0
+
+    spin_threshold_logits: dict[int, list[object]] | None
+    categorical_gumbel: dict[int, list[object]] | None
+    gaussian_noise: dict[int, list[object]] | None
 
 
 def _normalize_tool_path(command: str | Path) -> str:
@@ -134,8 +148,7 @@ def make_ttmlir_config(
     if build_dir is None and ttmlir_opt is None and ttmlir_translate is None:
         if env_build_dir is None:
             raise ValueError(
-                "TT-MLIR tools must be configured. Pass build_dir, explicit tool paths, "
-                "or set TTMLIR_BUILD_DIR."
+                "TT-MLIR tools must be configured. Pass build_dir, explicit tool paths, " "or set TTMLIR_BUILD_DIR."
             )
         build_dir = env_build_dir
 
@@ -147,9 +160,11 @@ def make_ttmlir_config(
         ttmlir_opt = build_dir / "bin" / "ttmlir-opt"
         ttmlir_translate = build_dir / "bin" / "ttmlir-translate"
 
+    if ttmlir_opt is None or ttmlir_translate is None:
+        raise ValueError("TT-MLIR tool paths could not be resolved.")
+
     resolved_artifact_root = Path(
-        artifact_root if artifact_root is not None
-        else Path(tempfile.gettempdir()) / "tt-thrml"
+        artifact_root if artifact_root is not None else Path(tempfile.gettempdir()) / "tt-thrml"
     ).resolve()
 
     return TTMLIRConfig(
@@ -203,12 +218,11 @@ def close_devices(ttnn, devices) -> None:
 
 
 def is_mesh_device(device) -> bool:
-    get_ids = getattr(device, "get_device_ids", None)
-    return callable(get_ids) and len(get_ids()) > 1
+    return len(device_ids(device)) > 1
 
 
 def device_ids(device) -> tuple[int, ...]:
     get_ids = getattr(device, "get_device_ids", None)
     if callable(get_ids):
-        return tuple(int(d) for d in get_ids())
+        return tuple(int(d) for d in cast(Iterable[Any], get_ids()))
     return ()

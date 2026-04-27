@@ -1,7 +1,7 @@
 """Fused executor with device-resident global state and bulk RNG.
 
-Each sweep, for each block, invokes a single compiled kernel
-    (global_state, rng_slice) -> new_global_state
+Each sweep, for each THRML sampling group, invokes a single compiled kernel
+    (global_state, *rng_slices) -> new_global_state
 so all compute (gather, gamma, sampling, slice-update) happens inside the
 flatbuffer. The host keeps a pointer to the global_state tensor between
 kernel invocations and never reads it back mid-sweep.
@@ -9,25 +9,58 @@ kernel invocations and never reads it back mid-sweep.
 
 from __future__ import annotations
 
+import importlib
 import time
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-
-from thrml.block_sampling import BlockSamplingProgram, SamplingSchedule
 from thrml.block_management import Block
+from thrml.block_sampling import BlockSamplingProgram, SamplingSchedule
 
-from .core import (
-    Family,
-    TTMLIRConfig,
-    CompiledProgram,
-    BulkRNGBuffers,
-)
 from .compiler import compile_program
+from .core import BulkRNGBuffers, CompiledProgram, Family, TTMLIRConfig
 from .rng import generate_bulk_rng, generate_bulk_rng_for_schedule, make_rng_spec, slice_rng_for_sweep
+
+_RUNTIME_BRIDGE_NAMES = (
+    "create_runtime_device_from_ttnn",
+    "create_runtime_tensor_from_ttnn",
+    "get_ttnn_tensor_from_runtime_tensor",
+)
+
+
+def _has_runtime_bridge(module: Any) -> bool:
+    return all(callable(getattr(module, name, None)) for name in _RUNTIME_BRIDGE_NAMES)
+
+
+def _missing_runtime_bridge_error() -> RuntimeError:
+    required = ", ".join(_RUNTIME_BRIDGE_NAMES)
+    return RuntimeError(
+        "ttrt.runtime does not expose the TTNN runtime bridge APIs required for device-resident execution "
+        f"({required}). Use a TT-MLIR/TTRT build that includes the TTNN bridge bindings; no host-tensor "
+        "fallback is available."
+    )
+
+
+def _resolve_runtime_bridge(tt_runtime: Any) -> Any:
+    """Return the module that owns TTNN<->TTRT zero-copy bridge bindings."""
+    if _has_runtime_bridge(tt_runtime):
+        return tt_runtime
+
+    internal_runtime = getattr(tt_runtime, "_ttmlir_runtime", None)
+    if internal_runtime is None:
+        try:
+            internal_runtime = importlib.import_module("ttrt.runtime._ttmlir_runtime")
+        except ImportError:
+            internal_runtime = None
+
+    runtime_utils = getattr(internal_runtime, "utils", None)
+    if _has_runtime_bridge(runtime_utils):
+        return runtime_utils
+
+    raise _missing_runtime_bridge_error()
 
 
 class Executor:
@@ -48,8 +81,8 @@ class Executor:
         self.config = config
         self.n_sweeps = n_sweeps
         self.profile = profile
-        self.compiled = compiled if compiled is not None else compile_program(
-            ttnn, device, program, config, n_sweeps=n_sweeps
+        self.compiled = (
+            compiled if compiled is not None else compile_program(ttnn, device, program, config, n_sweeps=n_sweeps)
         )
 
         self._global_state: object | None = None
@@ -58,10 +91,10 @@ class Executor:
         self._sweep_counter = 0
         self._rng_n_sweeps = 0
 
-        self._tt_runtime = None
-        self._runtime_utils = None
-        self._runtime_device = None
-        self._binary_cache: dict[Path, object] = {}
+        self._tt_runtime: Any | None = None
+        self._runtime_utils: Any | None = None
+        self._runtime_device: Any | None = None
+        self._binary_cache: dict[Path, Any] = {}
         self._timing_log: list[tuple[str, float, float]] = []
 
     @property
@@ -79,11 +112,10 @@ class Executor:
             block_arrays.append(self._block_state_to_global_chunk(n_free + i, state))
 
         if len(block_arrays) != len(self.compiled.blocks):
-            raise ValueError(
-                f"Expected {len(self.compiled.blocks)} block states, got {len(block_arrays)}"
-            )
+            raise ValueError(f"Expected {len(self.compiled.blocks)} block states, got {len(block_arrays)}")
 
-        import torch
+        import torch  # type: ignore[reportMissingImports]
+
         global_arr = np.concatenate(block_arrays).astype(np.float32)
         tensor = torch.from_numpy(global_arr.copy()).contiguous()
         self._global_state = self.ttnn.from_torch(
@@ -124,13 +156,9 @@ class Executor:
             raise RuntimeError("RNG buffer exhausted - call prepare_rng again")
 
         sweep_idx = self._sweep_counter
-        n_free = self.compiled.n_free_blocks
 
-        for group in self.compiled.sampling_order:
-            for block_index in group:
-                if block_index >= n_free:
-                    continue
-                self._global_state = self._run_block_kernel(block_index, sweep_idx)
+        for group in self.compiled.sampling_groups:
+            self._global_state = self._run_sampling_group(group, sweep_idx)
 
         self._sweep_counter += 1
 
@@ -141,9 +169,12 @@ class Executor:
     def _run_block_kernel(self, block_index: int, sweep_idx: int) -> object:
         block = self.compiled.blocks[block_index]
         spec = block.spec
-        rng_slice = slice_rng_for_sweep(
-            self.ttnn, self._rng_buffers, sweep_idx, block_index, spec.family
-        )
+        if block.kernel_artifact is None:
+            raise RuntimeError("Block kernel artifact is not compiled; use sampling groups.")
+        rng_buffers = self._rng_buffers
+        if rng_buffers is None:
+            raise RuntimeError("RNG must be prepared before running sweep")
+        rng_slice = slice_rng_for_sweep(self.ttnn, rng_buffers, sweep_idx, block_index, spec.family)
         outputs = self._run_compiled_kernel(
             block.kernel_artifact,
             [self._global_state, rng_slice],
@@ -153,36 +184,67 @@ class Executor:
             raise RuntimeError(f"Expected 1 output from kernel, got {len(outputs)}")
         return outputs[0]
 
+    def _run_sampling_group(self, group, sweep_idx: int) -> object:
+        rng_buffers = self._rng_buffers
+        if rng_buffers is None:
+            raise RuntimeError("RNG must be prepared before running sweep")
+        inputs = [self._global_state]
+        family_labels = []
+        for block_index in group.block_indices:
+            spec = self.compiled.blocks[block_index].spec
+            family_labels.append(spec.family.value)
+            inputs.append(
+                slice_rng_for_sweep(
+                    self.ttnn,
+                    rng_buffers,
+                    sweep_idx,
+                    block_index,
+                    spec.family,
+                )
+            )
+        outputs = self._run_compiled_kernel(
+            group.kernel_artifact,
+            inputs,
+            family_label="+".join(family_labels),
+        )
+        if len(outputs) != 1:
+            raise RuntimeError(f"Expected 1 output from group kernel, got {len(outputs)}")
+        return outputs[0]
+
     def _ensure_runtime(self) -> None:
         if self._tt_runtime is not None:
             return
         try:
-            import ttrt.runtime as tt_runtime
+            import ttrt.runtime as tt_runtime  # type: ignore[reportMissingImports]
         except ImportError as exc:
             raise RuntimeError("ttrt.runtime not available") from exc
+        runtime_utils = _resolve_runtime_bridge(tt_runtime)
         self._tt_runtime = tt_runtime
-        self._runtime_utils = tt_runtime
-        self._runtime_device = tt_runtime.create_runtime_device_from_ttnn(self.device)
+        self._runtime_utils = runtime_utils
+        self._runtime_device = runtime_utils.create_runtime_device_from_ttnn(self.device)
 
-    def _get_binary(self, artifact_path: Path) -> object:
+    def _get_binary(self, artifact_path: Path) -> Any:
         cached = self._binary_cache.get(artifact_path)
         if cached is not None:
             return cached
-        from ttrt.common.util import Binary, FileManager, Logger
+        from ttrt.common.util import Binary, FileManager, Logger  # type: ignore[reportMissingImports]
+
+        if self._tt_runtime is None:
+            raise RuntimeError("TTRT runtime is not initialized")
         logger = Logger()
         binary = Binary(logger, FileManager(logger), str(artifact_path))
         self._tt_runtime.set_compatible_device_runtime(binary.fbb)
         self._binary_cache[artifact_path] = binary
         return binary
 
-    def _run_compiled_kernel(
-        self, artifact_path: Path, inputs: list[object], family_label: str = ""
-    ) -> list[object]:
+    def _run_compiled_kernel(self, artifact_path: Path, inputs: list[object], family_label: str = "") -> list[object]:
         self._ensure_runtime()
         binary = self._get_binary(artifact_path)
         tt_runtime = self._tt_runtime
         runtime_utils = self._runtime_utils
         runtime_device = self._runtime_device
+        if tt_runtime is None or runtime_utils is None or runtime_device is None:
+            raise RuntimeError("TTRT runtime is not initialized")
 
         runtime_inputs = []
         for i, tensor in enumerate(inputs):
@@ -225,7 +287,7 @@ class Executor:
                 continue
             spec = self.compiled.blocks[block_index].spec
             start = starts[block_index]
-            chunk = global_arr[start:start + spec.n_nodes]
+            chunk = global_arr[start : start + spec.n_nodes]
             result[block] = self._global_chunk_to_block_state(chunk, spec.family)
         return result
 
@@ -241,7 +303,7 @@ class Executor:
         for block_index, block in enumerate(self.compiled.blocks):
             spec = block.spec
             start = starts[block_index]
-            chunk = global_arr[start:start + spec.n_nodes]
+            chunk = global_arr[start : start + spec.n_nodes]
             arr = jnp.array(self._global_chunk_to_block_state(chunk, spec.family))
             if block_index < n_free:
                 state_free.append(arr)
@@ -250,9 +312,12 @@ class Executor:
         return state_free, state_clamped
 
     def _prepare_rng_for_n_sweeps(self, key, n_sweeps: int) -> None:
-        spec = make_rng_spec(self.compiled.blocks, n_sweeps)
+        spec = make_rng_spec(self.compiled.blocks[: self.compiled.n_free_blocks], n_sweeps)
         self._rng_buffers = generate_bulk_rng(
-            key, spec, self.ttnn, self.device,
+            key,
+            spec,
+            self.ttnn,
+            self.device,
             state_dtype=self.compiled.state_dtype,
             layout=self.compiled.layout,
         )
@@ -260,10 +325,14 @@ class Executor:
         self._rng_n_sweeps = n_sweeps
 
     def _prepare_rng_thrml_compat(self, key, schedule, n_total: int) -> None:
-        spec = make_rng_spec(self.compiled.blocks, n_total)
+        spec = make_rng_spec(self.compiled.blocks[: self.compiled.n_free_blocks], n_total)
         self._rng_buffers = generate_bulk_rng_for_schedule(
-            key, spec, schedule, self.compiled.n_free_blocks,
-            self.ttnn, self.device,
+            key,
+            spec,
+            schedule,
+            self.compiled.n_free_blocks,
+            self.ttnn,
+            self.device,
             state_dtype=self.compiled.state_dtype,
             layout=self.compiled.layout,
         )
@@ -284,9 +353,12 @@ class Executor:
         Mirrors thrml.sample_states: wraps sample_with_observation using StateObserver.
         """
         from thrml.observers import StateObserver
+
         f_observe = StateObserver(list(nodes_to_sample))
         _, results = self.sample_with_observation(
-            key, schedule, f_observe,
+            key,
+            schedule,
+            f_observe,
             init_state_free=init_state_free,
             state_clamp=state_clamp,
         )
@@ -300,6 +372,7 @@ class Executor:
         *,
         init_state_free,
         state_clamp=(),
+        observation_carry_init=None,
     ):
         """Run full sampling schedule, calling f_observe after each recorded sample.
 
@@ -313,7 +386,7 @@ class Executor:
 
         self.run_warmup(schedule.n_warmup)
 
-        carry = f_observe.init()
+        carry = f_observe.init() if observation_carry_init is None else observation_carry_init
         state_free, state_clamped = self._read_state_lists()
         carry, obs = f_observe(self.program, state_free, state_clamped, carry, jnp.array(0))
 

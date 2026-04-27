@@ -1,46 +1,31 @@
 """Tenstorrent execution backend for THRML.
 
-One fused kernel per block. Bulk RNG uploaded once. Zero host readback mid-sweep.
+One fused kernel per sampling group. Bulk RNG uploaded once. Zero host readback mid-sweep.
 """
 
+from .compiler import compile_program
+from .conditional_samplers import GaussianConditional
 from .core import (
-    Family,
-    TTMLIRConfig,
-    FusedBlockSpec,
+    BulkRNGBuffers,
     CompiledFusedBlock,
     CompiledProgram,
+    Family,
+    FusedBlockSpec,
     RNGSpec,
-    BulkRNGBuffers,
+    TTMLIRConfig,
+    close_device,
+    close_devices,
+    close_mesh_device,
+    device_ids,
+    is_mesh_device,
     make_ttmlir_config,
     open_device,
     open_devices,
     open_mesh_device,
-    close_device,
-    close_mesh_device,
-    close_devices,
-    is_mesh_device,
-    device_ids,
 )
-
-from .compiler import compile_program
-
-from .conditional_samplers import GaussianConditional
-
 from .executor import Executor, make_executor
-
-from .rng import (
-    make_rng_spec,
-    generate_bulk_rng,
-    slice_rng_for_sweep,
-)
-
-from .mesh import (
-    MeshExecutor,
-    make_mesh_executor,
-    mesh_size,
-    mesh_device_ids,
-    mesh_barrier,
-)
+from .mesh import MeshExecutor, make_mesh_executor, mesh_barrier, mesh_device_ids, mesh_size
+from .rng import generate_bulk_rng, make_rng_spec, slice_rng_for_sweep
 
 
 def sample_states(
@@ -87,18 +72,13 @@ def sample_with_observation(
         f_observe,
         init_state_free=init_state_free,
         state_clamp=state_clamp,
+        observation_carry_init=observation_carry_init,
     )
     return carry, results
 
 
 __all__ = [
-    "Family",
     "TTMLIRConfig",
-    "FusedBlockSpec",
-    "CompiledFusedBlock",
-    "CompiledProgram",
-    "RNGSpec",
-    "BulkRNGBuffers",
     "make_ttmlir_config",
     "open_device",
     "open_devices",
@@ -106,20 +86,11 @@ __all__ = [
     "close_device",
     "close_mesh_device",
     "close_devices",
-    "is_mesh_device",
-    "device_ids",
-    "compile_program",
-    "GaussianConditional",
     "Executor",
     "make_executor",
-    "make_rng_spec",
-    "generate_bulk_rng",
-    "slice_rng_for_sweep",
     "MeshExecutor",
     "make_mesh_executor",
-    "mesh_size",
-    "mesh_device_ids",
-    "mesh_barrier",
     "sample_states",
     "sample_with_observation",
+    "GaussianConditional",
 ]

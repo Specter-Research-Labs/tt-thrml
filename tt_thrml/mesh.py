@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any, Iterable, cast
+
 from thrml.block_sampling import BlockSamplingProgram
 
 from .core import TTMLIRConfig
@@ -11,7 +13,7 @@ from .executor import Executor
 def mesh_device_ids(device) -> tuple[int, ...]:
     get_ids = getattr(device, "get_device_ids", None)
     if callable(get_ids):
-        return tuple(int(d) for d in get_ids())
+        return tuple(int(d) for d in cast(Iterable[Any], get_ids()))
     return ()
 
 
@@ -36,13 +38,9 @@ class MeshExecutor(Executor):
             raise RuntimeError("RNG buffer exhausted - call prepare_rng again")
 
         sweep_idx = self._sweep_counter
-        n_free = self.compiled.n_free_blocks
 
-        for group in self.compiled.sampling_order:
-            for block_index in group:
-                if block_index >= n_free:
-                    continue
-                self._global_state = self._run_block_kernel(block_index, sweep_idx)
+        for group in self.compiled.sampling_groups:
+            self._global_state = self._run_sampling_group(group, sweep_idx)
             mesh_barrier(self.ttnn, self.device)
 
         self._sweep_counter += 1

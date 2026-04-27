@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
-
 from thrml.conditional_samplers import AbstractParametricConditionalSampler
 
 
@@ -35,9 +34,7 @@ class GaussianConditional(AbstractParametricConditionalSampler):
         linear = jnp.zeros(output_sd.shape, dtype=dtype)
         precision = jnp.zeros(output_sd.shape, dtype=dtype)
 
-        for interaction, active, state_slots in zip(
-            interactions, active_flags, states, strict=True
-        ):
+        for interaction, active, state_slots in zip(interactions, active_flags, states, strict=True):
             scale = active.astype(dtype)
             multiplicative = [
                 jnp.asarray(s).astype(dtype)

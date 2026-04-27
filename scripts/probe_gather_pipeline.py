@@ -28,14 +28,16 @@ import ttnn
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 import tt_thrml
+from tt_thrml.executor import _resolve_runtime_bridge
 
 
 def _lower_to_stablehlo(fn: Callable, *inputs) -> str:
     return jax.jit(fn).lower(*inputs).as_text(dialect="stablehlo")
 
 
-def _run_pipeline(stablehlo_text: str, artifact_dir: Path, system_desc_path: str,
-                  ttmlir_opt: str, ttmlir_translate: str) -> Path:
+def _run_pipeline(
+    stablehlo_text: str, artifact_dir: Path, system_desc_path: str, ttmlir_opt: str, ttmlir_translate: str
+) -> Path:
     artifact_dir.mkdir(parents=True, exist_ok=True)
     stablehlo_path = artifact_dir / "k.stablehlo.mlir"
     ttir_path = artifact_dir / "k.ttir.mlir"
@@ -44,20 +46,25 @@ def _run_pipeline(stablehlo_text: str, artifact_dir: Path, system_desc_path: str
     stablehlo_path.write_text(stablehlo_text)
 
     subprocess.run(
-        [ttmlir_opt, "--stablehlo-to-ttir-pipeline",
-         str(stablehlo_path), "-o", str(ttir_path)],
-        check=True, text=True,
+        [ttmlir_opt, "--stablehlo-to-ttir-pipeline", str(stablehlo_path), "-o", str(ttir_path)],
+        check=True,
+        text=True,
     )
     subprocess.run(
-        [ttmlir_opt,
-         f"--ttir-to-ttnn-backend-pipeline=enable-cpu-hoisted-const-eval=false system-desc-path={system_desc_path}",
-         str(ttir_path), "-o", str(ttnn_path)],
-        check=True, text=True,
+        [
+            ttmlir_opt,
+            f"--ttir-to-ttnn-backend-pipeline=enable-cpu-hoisted-const-eval=false system-desc-path={system_desc_path}",
+            str(ttir_path),
+            "-o",
+            str(ttnn_path),
+        ],
+        check=True,
+        text=True,
     )
     subprocess.run(
-        [ttmlir_translate, "--ttnn-to-flatbuffer",
-         str(ttnn_path), "-o", str(flatbuffer_path)],
-        check=True, text=True,
+        [ttmlir_translate, "--ttnn-to-flatbuffer", str(ttnn_path), "-o", str(flatbuffer_path)],
+        check=True,
+        text=True,
     )
     return flatbuffer_path
 
@@ -66,10 +73,7 @@ def _run_on_device(flatbuffer_path: Path, device, input_tensors: list) -> object
     import ttrt.runtime as tt_runtime
     from ttrt.common.util import Binary, FileManager, Logger
 
-    runtime_utils = tt_runtime
-    if not callable(getattr(tt_runtime, "create_runtime_device_from_ttnn", None)):
-        from ttrt.runtime import _ttmlir_runtime
-        runtime_utils = _ttmlir_runtime.utils
+    runtime_utils = _resolve_runtime_bridge(tt_runtime)
 
     logger = Logger()
     binary = Binary(logger, FileManager(logger), str(flatbuffer_path))
@@ -102,8 +106,9 @@ def _download(t) -> np.ndarray:
     return ttnn.to_torch(t).cpu().numpy()
 
 
-def stage1_pure_gather(artifact_root: Path, system_desc_path: str,
-                       ttmlir_opt: str, ttmlir_translate: str, device) -> None:
+def stage1_pure_gather(
+    artifact_root: Path, system_desc_path: str, ttmlir_opt: str, ttmlir_translate: str, device
+) -> None:
     print("\n=== stage 1: pure gather ===")
 
     global_state_np = np.array([10.0, 20.0, 30.0, 40.0, 50.0], dtype=np.float32)
@@ -119,8 +124,7 @@ def stage1_pure_gather(artifact_root: Path, system_desc_path: str,
     print("StableHLO (first 400 chars):")
     print(stablehlo[:400])
 
-    fb = _run_pipeline(stablehlo, artifact_root / "stage1", system_desc_path,
-                       ttmlir_opt, ttmlir_translate)
+    fb = _run_pipeline(stablehlo, artifact_root / "stage1", system_desc_path, ttmlir_opt, ttmlir_translate)
     print(f"compiled -> {fb}")
 
     gs_tensor = _upload(device, global_state_np)
@@ -135,8 +139,9 @@ def stage1_pure_gather(artifact_root: Path, system_desc_path: str,
         print("STAGE 1 MISMATCH")
 
 
-def stage2_gather_arith(artifact_root: Path, system_desc_path: str,
-                        ttmlir_opt: str, ttmlir_translate: str, device) -> None:
+def stage2_gather_arith(
+    artifact_root: Path, system_desc_path: str, ttmlir_opt: str, ttmlir_translate: str, device
+) -> None:
     print("\n=== stage 2: gather -> multiply -> reduce (gamma) ===")
 
     # 5-node Ising chain: block 0 = nodes 0,2,4 (3 targets), block 1 = nodes 1,3
@@ -160,8 +165,7 @@ def stage2_gather_arith(artifact_root: Path, system_desc_path: str,
     print("StableHLO (first 600 chars):")
     print(stablehlo[:600])
 
-    fb = _run_pipeline(stablehlo, artifact_root / "stage2", system_desc_path,
-                       ttmlir_opt, ttmlir_translate)
+    fb = _run_pipeline(stablehlo, artifact_root / "stage2", system_desc_path, ttmlir_opt, ttmlir_translate)
     print(f"compiled -> {fb}")
 
     gs_tensor = _upload(device, global_state_np)
@@ -176,8 +180,9 @@ def stage2_gather_arith(artifact_root: Path, system_desc_path: str,
         print("STAGE 2 MISMATCH")
 
 
-def stage3_full_sweep(artifact_root: Path, system_desc_path: str,
-                      ttmlir_opt: str, ttmlir_translate: str, device) -> None:
+def stage3_full_sweep(
+    artifact_root: Path, system_desc_path: str, ttmlir_opt: str, ttmlir_translate: str, device
+) -> None:
     print("\n=== stage 3: full fused sweep (gather + gamma + where) ===")
 
     global_state_np = np.array([1.0, -1.0, 1.0, -1.0, 1.0], dtype=np.float32)
@@ -203,8 +208,7 @@ def stage3_full_sweep(artifact_root: Path, system_desc_path: str,
     print("StableHLO (first 800 chars):")
     print(stablehlo[:800])
 
-    fb = _run_pipeline(stablehlo, artifact_root / "stage3", system_desc_path,
-                       ttmlir_opt, ttmlir_translate)
+    fb = _run_pipeline(stablehlo, artifact_root / "stage3", system_desc_path, ttmlir_opt, ttmlir_translate)
     print(f"compiled -> {fb}")
 
     gs_tensor = _upload(device, global_state_np)

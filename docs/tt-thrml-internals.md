@@ -5,45 +5,45 @@
 - upstream `thrml` owns program authoring
 - `tt-thrml` owns Tenstorrent execution
 
-The executor compiles each block once to a fused TT-MLIR flatbuffer kernel, keeps all block states concatenated in a single on-device tensor, and runs sweeps by invoking each kernel with a pre-uploaded RNG slice.
+The executor compiles each THRML sampling group once to a fused TT-MLIR flatbuffer kernel, keeps all block states concatenated in a single on-device tensor, and runs sweeps by invoking each group kernel with pre-uploaded RNG slices.
 
 ## Architecture
 
 ```mermaid
 flowchart TD
     A["THRML BlockSamplingProgram"] --> B["compile_program()"]
-    B --> C["CompiledProgram\n(one CompiledFusedBlock per block)"]
+    B --> C["CompiledProgram\n(block specs + group kernels)"]
     C --> D["Executor / MeshExecutor"]
     D --> E["global_state\n(all blocks, flat float32 tensor)"]
     D --> F["BulkRNGBuffers\n(per-block per-sweep, pre-uploaded)"]
     E --> G["run_sweep()"]
     F --> G
-    G --> H["for each free block:\n_run_block_kernel(block_index, sweep_idx)"]
-    H --> I["(global_state, rng_slice) → new_global_state\nvia TTRT flatbuffer"]
+    G --> H["for each sampling group:\n_run_sampling_group(group, sweep_idx)"]
+    H --> I["(global_state, *rng_slices) → new_global_state\nvia TTRT flatbuffer"]
 ```
 
 ## Compilation
 
-Each THRML block is compiled to a single flatbuffer that fuses all of its interactions.
+Each THRML block is lowered to a `FusedBlockSpec`; each sampling group is compiled to a single flatbuffer that fuses every block in the group.
 
 ```mermaid
 flowchart TD
     A["Block + interactions"] --> B["FusedBlockSpec\n(weighted_mask, gather_indices\nper interaction)"]
-    B --> C["JAX function:\ngather sources → compute gamma/theta/params → sample"]
+    B --> C["JAX group function:\ngather sources → compute all block updates → commit together"]
     C --> D["jax.export → StableHLO"]
     D --> E["ttmlir-opt:\nStableHLO → TTIR → TTNN"]
     E --> F["ttmlir-translate:\nTTNN → flatbuffer .ttnn"]
-    F --> G["CompiledFusedBlock\n(artifact path cached by SHA256 signature)"]
+    F --> G["CompiledSamplingGroup\n(artifact path cached by SHA256 signature)"]
 ```
 
 ## Sweep Flow
 
 ```mermaid
 flowchart TD
-    A["run_sweep(sweep_idx)"] --> B["for each free block in sampling order"]
-    B --> C["slice_rng_for_sweep(sweep_idx, block_index)"]
-    C --> D["_run_compiled_kernel(\n  artifact_path,\n  [global_state, rng_slice]\n)"]
-    D --> E["new_global_state"]
+    A["run_sweep(sweep_idx)"] --> B["for each sampling group in order"]
+    B --> C["slice_rng_for_sweep for every block in group"]
+    C --> D["_run_compiled_kernel(\n  artifact_path,\n  [global_state, *rng_slices]\n)"]
+    D --> E["new_global_state\n(all group updates committed)"]
     E --> F["update global_state pointer"]
     F --> G{"more blocks?"}
     G -->|yes| B
@@ -52,7 +52,7 @@ flowchart TD
 
 ## Kernel Structure (per family)
 
-Each fused kernel takes `(global_state, rng_slice)` and returns `new_global_state`. All interaction math, sampling, and state update happen inside the flatbuffer.
+Each fused group kernel takes `(global_state, *rng_slices)` and returns `new_global_state`. All interaction math, sampling, and state update happen inside the flatbuffer.
 
 **Spin:**
 ```
@@ -112,6 +112,7 @@ All blocks are concatenated into one flat `float32` tensor:
 - Spin states are stored as `±1.0`.
 - Categorical states are stored as the integer category index cast to `float32`.
 - Gaussian states are stored directly as `float32`.
+- THRML `(global_state_index, relative_index)` source slices are lowered once into this flat block-ordered layout before compilation.
 
 ## Device Ownership
 

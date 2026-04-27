@@ -67,7 +67,7 @@ spin/categorical-source plan and executes it with TT-Lang on Wormhole. The
 validated dispatch job was:
 
 ```text
-j-quietbox-ttlang-thrml-plan-hw-strict-hi246h
+j-quietbox-ttlang-thrml-executor-shell-hw-hihsvc
 ```
 
 One detail matters for the final executor: `ttl.math.sign(0)` returns `0`,

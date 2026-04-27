@@ -22,13 +22,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
 from tests.parity._parity_runner import _make_mixed_case
-from tests.test_ttlang_backend import _compiled_specs_for
-from tt_thrml.ttlang_backend import (
-    build_spin_categorical_plan,
-    build_ttlang_state_layout,
-    encode_state,
-    evaluate_spin_categorical_plan,
-)
+from tt_thrml.ttlang_backend import ExperimentalTTLangExecutor, TTLangSpinCategoricalRun
 
 TILE = 32
 N_CATEGORIES = 3
@@ -117,51 +111,63 @@ def _case_state(category: int) -> list[np.ndarray]:
     ]
 
 
-def main() -> None:
-    compiled_blocks = _compiled_specs_for(_make_mixed_case().program)
-    layout = build_ttlang_state_layout(compiled_blocks)
-    plan = build_spin_categorical_plan(layout, compiled_blocks[0].spec)
+def _run_case(device, run: TTLangSpinCategoricalRun) -> None:
+    plan = run.plan
     if plan.n_categorical_terms != 1 or len(plan.categorical_weights[0]) != N_CATEGORIES:
         raise RuntimeError(f"unsupported plan shape: {plan}")
+
+    cat_values = list(run.categorical_values[0])
+    weight_values = [float(weight) for weight in plan.categorical_weights[0]]
+    expected = torch.full((TILE, TILE), run.expected_spin, dtype=torch.bfloat16)
+
+    cat_state = from_torch(_tile_planes(cat_values), device=device)
+    weights = from_torch(_tile_planes(weight_values), device=device)
+    bias = from_torch(torch.full((TILE, TILE), plan.bias, dtype=torch.bfloat16), device=device)
+    threshold = from_torch(torch.full((TILE, TILE), run.threshold_logit, dtype=torch.bfloat16), device=device)
+    half = from_torch(torch.full((TILE, TILE), 0.5, dtype=torch.bfloat16), device=device)
+    out = from_torch(torch.zeros((TILE, TILE), dtype=torch.bfloat16), device=device)
+
+    thrml_spin_categorical_plan_tile(cat_state, weights, bias, threshold, half, out)
+    result = ttnn.to_torch(out).to(torch.bfloat16)
+
+    mismatches = result != expected
+    print(
+        "case",
+        {
+            "cat_values": cat_values,
+            "weights": weight_values,
+            "bias": plan.bias,
+            "threshold_logit": run.threshold_logit,
+        },
+    )
+    print("result", result)
+    print("expected", expected)
+    if mismatches.any():
+        first = mismatches.nonzero()[0].tolist()
+        print("mismatches", int(mismatches.sum().item()))
+        print(
+            "first mismatch",
+            first,
+            "result",
+            result[first[0], first[1]],
+            "expected",
+            expected[first[0], first[1]],
+        )
+        raise AssertionError("TT-Lang spin categorical plan mismatch")
+
+
+def main() -> None:
+    executor = ExperimentalTTLangExecutor(_make_mixed_case().program)
 
     device = ttnn.open_device(device_id=0)
     try:
         for category in (0, 1):
-            state_lanes = encode_state(layout, _case_state(category))
-            cat_values = [float(state_lanes[lane]) for lane in plan.categorical_lane_groups[0]]
-            weight_values = [float(weight) for weight in plan.categorical_weights[0]]
-            expected_value = evaluate_spin_categorical_plan(plan, state_lanes, threshold_logit=THRESHOLD_LOGIT)
-            expected = torch.full((TILE, TILE), expected_value, dtype=torch.bfloat16)
-
-            cat_state = from_torch(_tile_planes(cat_values), device=device)
-            weights = from_torch(_tile_planes(weight_values), device=device)
-            bias = from_torch(torch.full((TILE, TILE), plan.bias, dtype=torch.bfloat16), device=device)
-            threshold = from_torch(torch.full((TILE, TILE), THRESHOLD_LOGIT, dtype=torch.bfloat16), device=device)
-            half = from_torch(torch.full((TILE, TILE), 0.5, dtype=torch.bfloat16), device=device)
-            out = from_torch(torch.zeros((TILE, TILE), dtype=torch.bfloat16), device=device)
-
-            thrml_spin_categorical_plan_tile(cat_state, weights, bias, threshold, half, out)
-            result = ttnn.to_torch(out).to(torch.bfloat16)
-
-            mismatches = result != expected
-            print(
-                "case",
-                {"category": category, "cat_values": cat_values, "weights": weight_values, "bias": plan.bias},
+            run = executor.materialize_spin_categorical_run(
+                0,
+                _case_state(category),
+                threshold_logit=THRESHOLD_LOGIT,
             )
-            print("result", result)
-            print("expected", expected)
-            if mismatches.any():
-                first = mismatches.nonzero()[0].tolist()
-                print("mismatches", int(mismatches.sum().item()))
-                print(
-                    "first mismatch",
-                    first,
-                    "result",
-                    result[first[0], first[1]],
-                    "expected",
-                    expected[first[0], first[1]],
-                )
-                raise AssertionError("TT-Lang spin categorical plan mismatch")
+            _run_case(device, run)
 
         print("PASS: TT-Lang THRML spin categorical plan")
     finally:

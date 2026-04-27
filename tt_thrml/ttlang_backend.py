@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from typing import Iterable, Sequence
 
 import numpy as np
+from thrml.block_sampling import BlockSamplingProgram
 
 from .core import CompiledFusedBlock, Family, FusedBlockSpec
 
@@ -74,8 +75,94 @@ class TTLangSpinCategoricalPlan:
         return len(self.categorical_lane_groups)
 
 
+@dataclass(frozen=True)
+class TTLangSpinCategoricalRun:
+    plan: TTLangSpinCategoricalPlan
+    categorical_values: tuple[tuple[float, ...], ...]
+    threshold_logit: float
+    expected_spin: float
+
+
+class ExperimentalTTLangExecutor:
+    """Planning shell for the first TT-Lang executor path.
+
+    This class does not claim full THRML execution. It captures the shared
+    pieces a real TT-Lang executor needs first: THRML block lowering,
+    family-specific state encoding, and supported spin/categorical-source
+    plan materialization.
+    """
+
+    def __init__(self, program: BlockSamplingProgram):
+        self.program = program
+        self.compiled_blocks = build_ttlang_compiled_blocks(program)
+        self.layout = build_ttlang_state_layout(self.compiled_blocks)
+        plans = []
+        for block in self.compiled_blocks[: len(program.gibbs_spec.free_blocks)]:
+            try:
+                plans.append(build_spin_categorical_plan(self.layout, block.spec))
+            except ValueError:
+                continue
+        self.spin_categorical_plans = tuple(plans)
+
+    def encode_state(self, state_free: Sequence[object], state_clamp: Sequence[object] = ()) -> np.ndarray:
+        return encode_state(self.layout, tuple(state_free) + tuple(state_clamp))
+
+    def materialize_spin_categorical_run(
+        self,
+        plan_index: int,
+        state_free: Sequence[object],
+        state_clamp: Sequence[object] = (),
+        *,
+        threshold_logit: float,
+    ) -> TTLangSpinCategoricalRun:
+        plan = self.spin_categorical_plans[plan_index]
+        state_lanes = self.encode_state(state_free, state_clamp)
+        categorical_values = []
+        for lane_group in plan.categorical_lane_groups:
+            categorical_values.append(tuple(float(state_lanes[lane]) for lane in lane_group))
+        return TTLangSpinCategoricalRun(
+            plan=plan,
+            categorical_values=tuple(categorical_values),
+            threshold_logit=float(threshold_logit),
+            expected_spin=evaluate_spin_categorical_plan(plan, state_lanes, threshold_logit),
+        )
+
+
 def _as_spec(block_or_spec: CompiledFusedBlock | FusedBlockSpec) -> FusedBlockSpec:
     return block_or_spec.spec if isinstance(block_or_spec, CompiledFusedBlock) else block_or_spec
+
+
+def build_ttlang_compiled_blocks(program: BlockSamplingProgram) -> tuple[CompiledFusedBlock, ...]:
+    """Build THRML block specs for TT-Lang planning without compiling TT-MLIR."""
+    from .compiler import _build_fused_block_spec, _build_global_state_layout, _infer_family
+
+    scalar_layout = _build_global_state_layout(program.gibbs_spec)
+    specs = []
+    n_free = len(program.gibbs_spec.free_blocks)
+    for block_index, block in enumerate(program.gibbs_spec.blocks):
+        family = _infer_family(block, program.gibbs_spec)
+        if block_index < n_free:
+            spec = _build_fused_block_spec(
+                program,
+                block_index,
+                block,
+                family,
+                scalar_layout.block_starts[block_index],
+                scalar_layout.total_nodes,
+                scalar_layout,
+            )
+        else:
+            spec = FusedBlockSpec(
+                block_index=block_index,
+                family=family,
+                n_nodes=len(block.nodes),
+                n_categories=None,
+                block_global_start=scalar_layout.block_starts[block_index],
+                total_nodes=scalar_layout.total_nodes,
+                interactions=(),
+            )
+        specs.append(CompiledFusedBlock(spec=spec, kernel_artifact=None))
+    return tuple(specs)
 
 
 def build_ttlang_state_layout(blocks: Sequence[CompiledFusedBlock | FusedBlockSpec]) -> TTLangStateLayout:

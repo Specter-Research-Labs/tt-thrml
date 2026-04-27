@@ -3,10 +3,11 @@ from __future__ import annotations
 import numpy as np
 
 from tests.parity._parity_runner import _make_mixed_case
-from tt_thrml.compiler import _build_fused_block_spec, _build_global_state_layout, _infer_family
-from tt_thrml.core import CompiledFusedBlock, Family, FusedBlockSpec
+from tt_thrml.core import Family
 from tt_thrml.ttlang_backend import (
+    ExperimentalTTLangExecutor,
     build_spin_categorical_plan,
+    build_ttlang_compiled_blocks,
     build_ttlang_state_layout,
     categorical_source_lanes,
     decode_state,
@@ -16,37 +17,8 @@ from tt_thrml.ttlang_backend import (
 )
 
 
-def _compiled_specs_for(program):
-    scalar_layout = _build_global_state_layout(program.gibbs_spec)
-    specs = []
-    for block_index, block in enumerate(program.gibbs_spec.blocks):
-        family = _infer_family(block, program.gibbs_spec)
-        if block_index < len(program.gibbs_spec.free_blocks):
-            spec = _build_fused_block_spec(
-                program,
-                block_index,
-                block,
-                family,
-                scalar_layout.block_starts[block_index],
-                scalar_layout.total_nodes,
-                scalar_layout,
-            )
-        else:
-            spec = FusedBlockSpec(
-                block_index=block_index,
-                family=family,
-                n_nodes=len(block.nodes),
-                n_categories=None,
-                block_global_start=scalar_layout.block_starts[block_index],
-                total_nodes=scalar_layout.total_nodes,
-                interactions=(),
-            )
-        specs.append(CompiledFusedBlock(spec=spec, kernel_artifact=None))
-    return tuple(specs)
-
-
 def test_ttlang_state_layout_expands_categorical_blocks_to_one_hot_lanes():
-    compiled_blocks = _compiled_specs_for(_make_mixed_case().program)
+    compiled_blocks = build_ttlang_compiled_blocks(_make_mixed_case().program)
     layout = build_ttlang_state_layout(compiled_blocks)
 
     assert [block.family for block in layout.blocks] == [
@@ -63,7 +35,7 @@ def test_ttlang_state_layout_expands_categorical_blocks_to_one_hot_lanes():
 
 
 def test_ttlang_state_round_trips_thrml_host_shapes():
-    compiled_blocks = _compiled_specs_for(_make_mixed_case().program)
+    compiled_blocks = build_ttlang_compiled_blocks(_make_mixed_case().program)
     layout = build_ttlang_state_layout(compiled_blocks)
     states = [
         np.asarray([True]),
@@ -90,14 +62,14 @@ def test_ttlang_state_round_trips_thrml_host_shapes():
 
 
 def test_ttlang_categorical_source_lanes_address_all_category_planes():
-    compiled_blocks = _compiled_specs_for(_make_mixed_case().program)
+    compiled_blocks = build_ttlang_compiled_blocks(_make_mixed_case().program)
     layout = build_ttlang_state_layout(compiled_blocks)
 
     np.testing.assert_array_equal(categorical_source_lanes(layout, [1, 4], 3), np.asarray([[1, 2, 3], [6, 7, 8]]))
 
 
 def test_ttlang_expands_mixed_program_categorical_gather_to_one_hot_lanes():
-    compiled_blocks = _compiled_specs_for(_make_mixed_case().program)
+    compiled_blocks = build_ttlang_compiled_blocks(_make_mixed_case().program)
     layout = build_ttlang_state_layout(compiled_blocks)
 
     first_spin = compiled_blocks[0].spec
@@ -105,13 +77,15 @@ def test_ttlang_expands_mixed_program_categorical_gather_to_one_hot_lanes():
 
     assert categorical_interaction.n_categorical == 1
     np.testing.assert_array_equal(
-        expand_categorical_gather_lanes(layout, categorical_interaction.gather_indices[0], 3),
+        expand_categorical_gather_lanes(
+            layout, np.asarray(categorical_interaction.gather_indices[0], dtype=np.int32), 3
+        ),
         np.asarray([[[1, 2, 3]]], dtype=np.int32),
     )
 
 
 def test_ttlang_builds_spin_categorical_plan_from_mixed_program_spec():
-    compiled_blocks = _compiled_specs_for(_make_mixed_case().program)
+    compiled_blocks = build_ttlang_compiled_blocks(_make_mixed_case().program)
     layout = build_ttlang_state_layout(compiled_blocks)
     plan = build_spin_categorical_plan(layout, compiled_blocks[0].spec)
 
@@ -146,3 +120,27 @@ def test_ttlang_builds_spin_categorical_plan_from_mixed_program_spec():
 
     assert evaluate_spin_categorical_plan(plan, cat_zero, threshold_logit=0.0) == 1.0
     assert evaluate_spin_categorical_plan(plan, cat_one, threshold_logit=0.0) == -1.0
+
+
+def test_experimental_ttlang_executor_materializes_supported_spin_plan():
+    executor = ExperimentalTTLangExecutor(_make_mixed_case().program)
+
+    assert len(executor.spin_categorical_plans) == 2
+
+    run = executor.materialize_spin_categorical_run(
+        0,
+        [
+            np.asarray([True]),
+            np.asarray([1], dtype=np.uint8),
+            np.asarray([0.0], dtype=np.float32),
+            np.asarray([False]),
+            np.asarray([1], dtype=np.uint8),
+            np.asarray([0.0], dtype=np.float32),
+        ],
+        threshold_logit=0.0,
+    )
+
+    assert run.plan.block_index == 0
+    assert run.categorical_values == ((0.0, 1.0, 0.0),)
+    assert run.threshold_logit == 0.0
+    assert run.expected_spin == -1.0

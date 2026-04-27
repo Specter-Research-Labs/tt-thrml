@@ -80,11 +80,19 @@ j-quietbox-ttlang-spin-categorical-plan-hw-shared-program-hj4zsy
 j-quietbox-ttlang-categorical-spin-plan-hw-scorebuf-hj4hzj
 j-quietbox-ttlang-discrete-sweep-hw-copy3-hjmuox
 j-quietbox-ttlang-discrete-sweep-bench-50-hjvh1e
+j-quietbox-ttlang-discrete-sweep-bench-50-after-reboot-hkw0q6
+j-quietbox-ttmlir-demo-profile-after-reboot-hkwz4n
 ```
 
-The 50-sweep TT-Lang benchmark job measured 32.54 ms total, or 0.651
+The latest 50-sweep TT-Lang benchmark measured 32.12 ms total, or 0.642
 ms/sweep, for the current narrow implementation. It still uses six dispatches
 per sweep, so this is a baseline before fusing group copy/update work.
+
+The current TT-MLIR/TTRT demo profile is not the same narrow workload, but it
+shows the overhead we are trying to escape: the mixed demo reported mean
+dispatch costs of 0.665 ms for spin, 1.251 ms for categorical, and 0.684 ms for
+gaussian block calls. That makes the TT-Lang discrete runner directionally
+promising even before dispatch fusion.
 
 One detail matters for the final executor: `ttl.math.sign(0)` returns `0`,
 while THRML's spin update uses a strict `>` decision whose tie result is the

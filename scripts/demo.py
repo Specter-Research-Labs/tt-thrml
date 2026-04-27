@@ -39,13 +39,9 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 import numpy as np
-
 from thrml.block_management import Block
-from thrml.block_sampling import (
-    BlockGibbsSpec,
-    SamplingSchedule,
-    sample_states as cpu_sample_states,
-)
+from thrml.block_sampling import BlockGibbsSpec, SamplingSchedule
+from thrml.block_sampling import sample_states as cpu_sample_states
 from thrml.factor import AbstractFactor, FactorSamplingProgram
 from thrml.interaction import InteractionGroup
 from thrml.models.discrete_ebm import (
@@ -58,8 +54,8 @@ from thrml.pgm import AbstractNode, CategoricalNode, SpinNode
 
 import tt_thrml
 
-
 # ── Custom node + interaction types (Gaussian family) ─────────────────────────
+
 
 class ContinuousNode(AbstractNode):
     pass
@@ -76,36 +72,45 @@ class _QuadraticInteraction(eqx.Module):
 def _linear_factor(weights: jax.Array, block: Block) -> AbstractFactor:
     class _F(AbstractFactor):
         _w: jax.Array
+
         def __init__(self):
             super().__init__([block])
             self._w = weights
+
         def to_interaction_groups(self):
             return [InteractionGroup(_LinearInteraction(self._w), self.node_groups[0], [])]
+
     return _F()
 
 
 def _quadratic_factor(inverse_weights: jax.Array, block: Block) -> AbstractFactor:
     class _F(AbstractFactor):
         _w: jax.Array
+
         def __init__(self):
             super().__init__([block])
             self._w = inverse_weights
+
         def to_interaction_groups(self):
             return [InteractionGroup(_QuadraticInteraction(self._w), self.node_groups[0], [])]
+
     return _F()
 
 
 def _coupling_factor(weights: jax.Array, block_a: Block, block_b: Block) -> AbstractFactor:
     class _F(AbstractFactor):
         _w: jax.Array
+
         def __init__(self):
             super().__init__([block_a, block_b])
             self._w = weights
+
         def to_interaction_groups(self):
             return [
                 InteractionGroup(_LinearInteraction(self._w), self.node_groups[0], [self.node_groups[1]]),
                 InteractionGroup(_LinearInteraction(self._w), self.node_groups[1], [self.node_groups[0]]),
             ]
+
     return _F()
 
 
@@ -209,9 +214,15 @@ def _mixed_program() -> Demo:
     cats = [CategoricalNode() for _ in range(n)]
     gauss = [ContinuousNode() for _ in range(n)]
     blocks = [
-        Block([spins[0]]), Block([cats[0]]), Block([gauss[0]]),
-        Block([spins[1]]), Block([cats[1]]), Block([gauss[1]]),
-        Block([spins[2]]), Block([cats[2]]), Block([gauss[2]]),
+        Block([spins[0]]),
+        Block([cats[0]]),
+        Block([gauss[0]]),
+        Block([spins[1]]),
+        Block([cats[1]]),
+        Block([gauss[1]]),
+        Block([spins[2]]),
+        Block([cats[2]]),
+        Block([gauss[2]]),
     ]
     sdt = {
         SpinNode: jax.ShapeDtypeStruct((), jnp.bool_),
@@ -255,6 +266,7 @@ def _mixed_program() -> Demo:
 
 # ── Runners ───────────────────────────────────────────────────────────────────
 
+
 def _clone(state: list) -> list:
     return [jnp.array(np.asarray(s).copy()) for s in state]
 
@@ -262,8 +274,11 @@ def _clone(state: list) -> list:
 def run_cpu(demo: Demo, key) -> tuple[list, float]:
     t0 = time.perf_counter()
     out = cpu_sample_states(
-        key, demo.program, demo.schedule,
-        _clone(demo.init_state_free), _clone(demo.state_clamp),
+        key,
+        demo.program,
+        demo.schedule,
+        _clone(demo.init_state_free),
+        _clone(demo.state_clamp),
         demo.nodes_to_sample,
     )
     return [np.asarray(s) for s in out], time.perf_counter() - t0
@@ -277,7 +292,9 @@ def run_wormhole(demo: Demo, key, *, ttnn, device, config, signpost, profile: bo
     ttnn.start_tracy_zone(__file__, demo.name, 0)
     t0 = time.perf_counter()
     out = executor.sample_states(
-        key, demo.schedule, demo.nodes_to_sample,
+        key,
+        demo.schedule,
+        demo.nodes_to_sample,
         init_state_free=_clone(demo.init_state_free),
         state_clamp=_clone(demo.state_clamp),
     )
@@ -303,6 +320,7 @@ def run_wormhole(demo: Demo, key, *, ttnn, device, config, signpost, profile: bo
 
 # ── Stats helpers ─────────────────────────────────────────────────────────────
 
+
 def _spin_mean(samples: np.ndarray) -> np.ndarray:
     return np.where(samples.astype(bool), 1.0, -1.0).mean(axis=0)
 
@@ -318,6 +336,7 @@ def _gauss_stats(samples: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 
 
 # ── Output ────────────────────────────────────────────────────────────────────
+
 
 def _print_row(label: str, value: str) -> None:
     print(f"  {label:<22} {value}")
@@ -341,7 +360,9 @@ def _report_block(s: np.ndarray) -> None:
 def _report(demo: Demo, cpu_out: list | None, cpu_s: float | None, tt_out: list | None, tt_s: float | None) -> None:
     print(f"\n{'─'*60}")
     print(f"  {demo.name}")
-    print(f"  {demo.schedule.n_samples} samples, {demo.schedule.n_warmup} warmup, {demo.schedule.steps_per_sample} steps/sample")
+    print(
+        f"  {demo.schedule.n_samples} samples, {demo.schedule.n_warmup} warmup, {demo.schedule.steps_per_sample} steps/sample"
+    )
     print()
 
     for label, (out, elapsed) in [("CPU (JAX)", (cpu_out, cpu_s)), ("Wormhole", (tt_out, tt_s))]:
@@ -361,6 +382,7 @@ def _report(demo: Demo, cpu_out: list | None, cpu_s: float | None, tt_out: list 
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
+
 
 def main() -> None:
     cpu_only = os.environ.get("TT_DEMO_CPU_ONLY", "0") == "1"
@@ -382,8 +404,10 @@ def main() -> None:
 
         try:
             from tracy import signpost as _sp
+
             signpost = _sp
         except ImportError:
+
             def signpost(**_):
                 pass
 
@@ -414,7 +438,9 @@ def main() -> None:
 
             tt_out = tt_s = None
             if not cpu_only:
-                tt_out, tt_s = run_wormhole(demo, tt_key, ttnn=ttnn, device=device, config=config, signpost=signpost, profile=profile)
+                tt_out, tt_s = run_wormhole(
+                    demo, tt_key, ttnn=ttnn, device=device, config=config, signpost=signpost, profile=profile
+                )
 
             _report(demo, cpu_out, cpu_s, tt_out, tt_s)
 

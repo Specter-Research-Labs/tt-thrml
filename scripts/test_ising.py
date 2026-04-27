@@ -9,12 +9,12 @@ import time
 from pathlib import Path
 
 import jax
-from jax import numpy as jnp
 import numpy as np
 import thrml
+import ttnn
+from jax import numpy as jnp
 from thrml.models import IsingEBM, IsingSamplingProgram, hinton_init
 from thrml.observers import MomentAccumulatorObserver
-import ttnn
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -88,9 +88,11 @@ def main():
         for i, block in enumerate(executor.compiled.blocks):
             spec = block.spec
             n_terms = sum(ispec.n_terms for ispec in spec.interactions)
-            print(f"  Block {i}: family={spec.family.value}, n_nodes={spec.n_nodes}, "
-                  f"n_interactions={len(spec.interactions)}, n_terms={n_terms}, "
-                  f"global_start={spec.block_global_start}")
+            print(
+                f"  Block {i}: family={spec.family.value}, n_nodes={spec.n_nodes}, "
+                f"n_interactions={len(spec.interactions)}, n_terms={n_terms}, "
+                f"global_start={spec.block_global_start}"
+            )
 
         print("\n--- Loading state ---")
         executor.load_state(init_state_free, state_clamp)
@@ -133,7 +135,9 @@ def main():
             print(f"Block {block_idx}: shape={samples_arr.shape}, mean={signed.mean():.4f}")
 
         print(f"Samples/sec: {schedule.n_samples / sample_time:.1f}")
-        print(f"Sweeps/sec: {(schedule.n_warmup + schedule.n_samples * schedule.steps_per_sample) / (warmup_time + sample_time):.1f}")
+        print(
+            f"Sweeps/sec: {(schedule.n_warmup + schedule.n_samples * schedule.steps_per_sample) / (warmup_time + sample_time):.1f}"
+        )
         sys.stdout.flush()
 
         print("\n--- sample_states (StateObserver via high-level API) ---")
@@ -179,8 +183,9 @@ def main():
         second_means = np.asarray(second_moments) / schedule.n_samples
         assert obs_out is None, "MomentAccumulatorObserver should return None observations"
         assert first_means.shape == (len(nodes),), f"unexpected first moments shape: {first_means.shape}"
-        assert second_means.shape == (len(nodes) * (len(nodes) - 1) // 2,), \
-            f"unexpected second moments shape: {second_means.shape}"
+        assert second_means.shape == (
+            len(nodes) * (len(nodes) - 1) // 2,
+        ), f"unexpected second moments shape: {second_means.shape}"
         print(f"  First moments (mean spin):  {np.round(first_means, 4)}")
         print(f"  Second moments (mean corr): {np.round(second_means, 4)}")
         sys.stdout.flush()
@@ -192,6 +197,7 @@ def main():
     except Exception as e:
         print(f"\n!!! ERROR: {type(e).__name__}: {e}")
         import traceback
+
         traceback.print_exc()
         sys.exit(1)
 

@@ -155,6 +155,9 @@ container_args+=(
     build_jobs="${TT_THRML_BUILD_JOBS:-$(nproc)}"
     cmake --build "${build_dir}" -- -j"${build_jobs}"
 
+    tt_metal_src="${upstream_src}/third_party/tt-metal/src/tt-metal"
+    export TT_METAL_HOME="${tt_metal_src}"
+    export PYTHONPATH="${build_dir}/tools/ttrt/build/lib:${build_dir}/python_packages:${build_dir}/runtime/python:${tt_metal_src}/ttnn:${tt_metal_src}/tools:${PYTHONPATH:-}"
     export TTMLIR_BUILD_DIR="${build_dir}"
     export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
 

@@ -9,6 +9,7 @@ kernel invocations and never reads it back mid-sweep.
 
 from __future__ import annotations
 
+import importlib
 import time
 from pathlib import Path
 from typing import Any, Sequence
@@ -22,6 +23,44 @@ from thrml.block_sampling import BlockSamplingProgram, SamplingSchedule
 from .compiler import compile_program
 from .core import BulkRNGBuffers, CompiledProgram, Family, TTMLIRConfig
 from .rng import generate_bulk_rng, generate_bulk_rng_for_schedule, make_rng_spec, slice_rng_for_sweep
+
+_RUNTIME_BRIDGE_NAMES = (
+    "create_runtime_device_from_ttnn",
+    "create_runtime_tensor_from_ttnn",
+    "get_ttnn_tensor_from_runtime_tensor",
+)
+
+
+def _has_runtime_bridge(module: Any) -> bool:
+    return all(callable(getattr(module, name, None)) for name in _RUNTIME_BRIDGE_NAMES)
+
+
+def _missing_runtime_bridge_error() -> RuntimeError:
+    required = ", ".join(_RUNTIME_BRIDGE_NAMES)
+    return RuntimeError(
+        "ttrt.runtime does not expose the TTNN runtime bridge APIs required for device-resident execution "
+        f"({required}). Use a TT-MLIR/TTRT build that includes the TTNN bridge bindings; no host-tensor "
+        "fallback is available."
+    )
+
+
+def _resolve_runtime_bridge(tt_runtime: Any) -> Any:
+    """Return the module that owns TTNN<->TTRT zero-copy bridge bindings."""
+    if _has_runtime_bridge(tt_runtime):
+        return tt_runtime
+
+    internal_runtime = getattr(tt_runtime, "_ttmlir_runtime", None)
+    if internal_runtime is None:
+        try:
+            internal_runtime = importlib.import_module("ttrt.runtime._ttmlir_runtime")
+        except ImportError:
+            internal_runtime = None
+
+    runtime_utils = getattr(internal_runtime, "utils", None)
+    if _has_runtime_bridge(runtime_utils):
+        return runtime_utils
+
+    raise _missing_runtime_bridge_error()
 
 
 class Executor:
@@ -179,9 +218,10 @@ class Executor:
             import ttrt.runtime as tt_runtime  # type: ignore[reportMissingImports]
         except ImportError as exc:
             raise RuntimeError("ttrt.runtime not available") from exc
+        runtime_utils = _resolve_runtime_bridge(tt_runtime)
         self._tt_runtime = tt_runtime
-        self._runtime_utils = tt_runtime
-        self._runtime_device = tt_runtime.create_runtime_device_from_ttnn(self.device)
+        self._runtime_utils = runtime_utils
+        self._runtime_device = runtime_utils.create_runtime_device_from_ttnn(self.device)
 
     def _get_binary(self, artifact_path: Path) -> Any:
         cached = self._binary_cache.get(artifact_path)

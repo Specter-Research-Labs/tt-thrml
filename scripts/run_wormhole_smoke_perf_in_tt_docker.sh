@@ -129,7 +129,7 @@ container_args+=(
   bash -lc '
     set -euo pipefail
     python3 -m ensurepip --upgrade >/dev/null 2>&1 || true
-    python3 -m pip install "${TT_THRML_REPO_ROOT}[testing]"
+    python3 -m pip install "${TT_THRML_REPO_ROOT}[runtime,testing]"
     python3 -m pip install --no-deps "${TT_THRML_TTRT_WHEEL}"
     cd "${TT_THRML_REPO_ROOT}"
     export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1

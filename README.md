@@ -61,19 +61,23 @@ The first hardware runners are:
 ```bash
 python scripts/run_ttlang_spin_categorical_plan.py
 python scripts/run_ttlang_categorical_spin_plan.py
+python scripts/run_ttlang_discrete_sweep.py
 ```
 
 They lower the shared mixed spin/categorical/gaussian smoke program into the
-first two TT-Lang plan shapes:
+first TT-Lang plan shapes:
 
 - spin target from one-hot categorical source lanes
 - categorical target from signed spin source lanes
+- a two-group discrete sweep that keeps the 10-lane backend state resident on
+  device between group updates
 
 The validated dispatch jobs were:
 
 ```text
 j-quietbox-ttlang-spin-categorical-plan-hw-shared-program-hj4zsy
 j-quietbox-ttlang-categorical-spin-plan-hw-scorebuf-hj4hzj
+j-quietbox-ttlang-discrete-sweep-hw-copy3-hjmuox
 ```
 
 One detail matters for the final executor: `ttl.math.sign(0)` returns `0`,

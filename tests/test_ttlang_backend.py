@@ -197,3 +197,35 @@ def test_experimental_ttlang_executor_materializes_supported_categorical_plan():
     assert run.spin_values == (1.0,)
     assert run.expected_category == 0
     assert run.expected_one_hot == (1.0, 0.0, 0.0)
+
+
+def test_experimental_ttlang_executor_evaluates_supported_discrete_sweep_by_group():
+    executor = ExperimentalTTLangExecutor(make_mixed_spin_categorical_gaussian_program())
+    state_lanes = executor.encode_state(
+        [
+            np.asarray([True]),
+            np.asarray([1], dtype=np.uint8),
+            np.asarray([0.25], dtype=np.float32),
+            np.asarray([False]),
+            np.asarray([1], dtype=np.uint8),
+            np.asarray([-0.75], dtype=np.float32),
+        ]
+    )
+
+    next_lanes = executor.evaluate_discrete_sweep(
+        state_lanes,
+        spin_threshold_logits={0: 0.0, 3: 0.0},
+        categorical_gumbel={1: (0.0, 0.0, 0.0), 4: (0.0, 0.0, 0.0)},
+    )
+
+    np.testing.assert_array_equal(
+        next_lanes,
+        np.asarray([-1.0, 1.0, 0.0, 0.0, 0.25, 1.0, 1.0, 0.0, 0.0, -0.75], dtype=np.float32),
+    )
+    decoded = decode_state(executor.layout, next_lanes)
+    assert decoded[0].tolist() == [False]
+    assert decoded[1].tolist() == [0]
+    np.testing.assert_allclose(decoded[2], [0.25])
+    assert decoded[3].tolist() == [True]
+    assert decoded[4].tolist() == [0]
+    np.testing.assert_allclose(decoded[5], [-0.75])

@@ -138,6 +138,9 @@ class ExperimentalTTLangExecutor:
                 pass
         self.spin_categorical_plans = tuple(plans)
         self.categorical_spin_plans = tuple(categorical_plans)
+        self._spin_plan_by_block = {plan.block_index: plan for plan in self.spin_categorical_plans}
+        self._categorical_plan_by_block = {plan.block_index: plan for plan in self.categorical_spin_plans}
+        self.sampling_order = tuple(tuple(int(index) for index in group) for group in program.gibbs_spec.sampling_order)
 
     def encode_state(self, state_free: Sequence[object], state_clamp: Sequence[object] = ()) -> np.ndarray:
         return encode_state(self.layout, tuple(state_free) + tuple(state_clamp))
@@ -182,6 +185,47 @@ class ExperimentalTTLangExecutor:
             expected_category=expected_category,
             expected_one_hot=expected_one_hot,
         )
+
+    def evaluate_discrete_sweep(
+        self,
+        state_lanes: np.ndarray,
+        *,
+        spin_threshold_logits: dict[int, float],
+        categorical_gumbel: dict[int, Sequence[float]],
+    ) -> np.ndarray:
+        """Evaluate one supported TT-Lang discrete sweep on backend state lanes.
+
+        Each sampling group reads a pre-group state snapshot and commits all
+        supported spin/categorical updates together. Unsupported gaussian lanes
+        are preserved by this narrow executor shell.
+        """
+        current = np.asarray(state_lanes, dtype=np.float32).reshape(-1).copy()
+        if current.shape[0] != self.layout.total_lanes:
+            raise ValueError(f"expected {self.layout.total_lanes} state lanes, got {current.shape[0]}")
+
+        for group in self.sampling_order:
+            group_input = current.copy()
+            group_output = current.copy()
+            for block_index in group:
+                spin_plan = self._spin_plan_by_block.get(block_index)
+                if spin_plan is not None:
+                    threshold_logit = spin_threshold_logits[block_index]
+                    group_output[spin_plan.output_lane] = evaluate_spin_categorical_plan(
+                        spin_plan, group_input, threshold_logit
+                    )
+                    continue
+
+                categorical_plan = self._categorical_plan_by_block.get(block_index)
+                if categorical_plan is not None:
+                    category = evaluate_categorical_spin_plan(
+                        categorical_plan, group_input, categorical_gumbel[block_index]
+                    )
+                    group_output[np.asarray(categorical_plan.output_lanes, dtype=np.int32)] = 0.0
+                    group_output[categorical_plan.output_lanes[category]] = 1.0
+
+            current = group_output
+
+        return current
 
 
 def _as_spec(block_or_spec: CompiledFusedBlock | FusedBlockSpec) -> FusedBlockSpec:

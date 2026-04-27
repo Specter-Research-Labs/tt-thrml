@@ -6,12 +6,14 @@ from tests.parity._parity_runner import _make_mixed_case
 from tt_thrml.core import Family
 from tt_thrml.ttlang_backend import (
     ExperimentalTTLangExecutor,
+    build_categorical_spin_plan,
     build_spin_categorical_plan,
     build_ttlang_compiled_blocks,
     build_ttlang_state_layout,
     categorical_source_lanes,
     decode_state,
     encode_state,
+    evaluate_categorical_spin_plan,
     evaluate_spin_categorical_plan,
     expand_categorical_gather_lanes,
 )
@@ -144,3 +146,54 @@ def test_experimental_ttlang_executor_materializes_supported_spin_plan():
     assert run.categorical_values == ((0.0, 1.0, 0.0),)
     assert run.threshold_logit == 0.0
     assert run.expected_spin == -1.0
+
+
+def test_ttlang_builds_categorical_spin_plan_from_mixed_program_spec():
+    compiled_blocks = build_ttlang_compiled_blocks(_make_mixed_case().program)
+    layout = build_ttlang_state_layout(compiled_blocks)
+    plan = build_categorical_spin_plan(layout, compiled_blocks[1].spec)
+
+    assert plan.block_index == 1
+    assert plan.output_lanes == (1, 2, 3)
+    np.testing.assert_allclose(plan.bias, (0.2, -0.1, 0.0))
+    assert plan.spin_lanes == (0,)
+    np.testing.assert_allclose(plan.spin_weights, ((0.55, -0.25, 0.15),))
+
+    state_lanes = encode_state(
+        layout,
+        [
+            np.asarray([True]),
+            np.asarray([0], dtype=np.uint8),
+            np.asarray([0.0], dtype=np.float32),
+            np.asarray([False]),
+            np.asarray([1], dtype=np.uint8),
+            np.asarray([0.0], dtype=np.float32),
+        ],
+    )
+
+    assert evaluate_categorical_spin_plan(plan, state_lanes, gumbel=(0.0, 0.0, 0.0)) == 0
+    assert evaluate_categorical_spin_plan(plan, state_lanes, gumbel=(-2.0, 2.0, 0.0)) == 1
+
+
+def test_experimental_ttlang_executor_materializes_supported_categorical_plan():
+    executor = ExperimentalTTLangExecutor(_make_mixed_case().program)
+
+    assert len(executor.categorical_spin_plans) == 2
+
+    run = executor.materialize_categorical_spin_run(
+        0,
+        [
+            np.asarray([True]),
+            np.asarray([0], dtype=np.uint8),
+            np.asarray([0.0], dtype=np.float32),
+            np.asarray([False]),
+            np.asarray([1], dtype=np.uint8),
+            np.asarray([0.0], dtype=np.float32),
+        ],
+        gumbel=(0.0, 0.0, 0.0),
+    )
+
+    assert run.plan.block_index == 1
+    assert run.spin_values == (1.0,)
+    assert run.expected_category == 0
+    assert run.expected_one_hot == (1.0, 0.0, 0.0)

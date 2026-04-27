@@ -83,6 +83,35 @@ class TTLangSpinCategoricalRun:
     expected_spin: float
 
 
+@dataclass(frozen=True)
+class TTLangCategoricalSpinPlan:
+    """A first TT-Lang-lowerable categorical block shape.
+
+    The block has one categorical node and zero or more spin source
+    contributions. Categorical state is represented as output category lanes;
+    scores are computed per category and sampled with argmax(score + gumbel).
+    """
+
+    block_index: int
+    output_lanes: tuple[int, ...]
+    bias: tuple[float, ...]
+    spin_lanes: tuple[int, ...]
+    spin_weights: tuple[tuple[float, ...], ...]
+
+    @property
+    def n_categories(self) -> int:
+        return len(self.output_lanes)
+
+
+@dataclass(frozen=True)
+class TTLangCategoricalSpinRun:
+    plan: TTLangCategoricalSpinPlan
+    spin_values: tuple[float, ...]
+    gumbel: tuple[float, ...]
+    expected_category: int
+    expected_one_hot: tuple[float, ...]
+
+
 class ExperimentalTTLangExecutor:
     """Planning shell for the first TT-Lang executor path.
 
@@ -97,12 +126,18 @@ class ExperimentalTTLangExecutor:
         self.compiled_blocks = build_ttlang_compiled_blocks(program)
         self.layout = build_ttlang_state_layout(self.compiled_blocks)
         plans = []
+        categorical_plans = []
         for block in self.compiled_blocks[: len(program.gibbs_spec.free_blocks)]:
             try:
                 plans.append(build_spin_categorical_plan(self.layout, block.spec))
             except ValueError:
-                continue
+                pass
+            try:
+                categorical_plans.append(build_categorical_spin_plan(self.layout, block.spec))
+            except ValueError:
+                pass
         self.spin_categorical_plans = tuple(plans)
+        self.categorical_spin_plans = tuple(categorical_plans)
 
     def encode_state(self, state_free: Sequence[object], state_clamp: Sequence[object] = ()) -> np.ndarray:
         return encode_state(self.layout, tuple(state_free) + tuple(state_clamp))
@@ -125,6 +160,27 @@ class ExperimentalTTLangExecutor:
             categorical_values=tuple(categorical_values),
             threshold_logit=float(threshold_logit),
             expected_spin=evaluate_spin_categorical_plan(plan, state_lanes, threshold_logit),
+        )
+
+    def materialize_categorical_spin_run(
+        self,
+        plan_index: int,
+        state_free: Sequence[object],
+        state_clamp: Sequence[object] = (),
+        *,
+        gumbel: Sequence[float],
+    ) -> TTLangCategoricalSpinRun:
+        plan = self.categorical_spin_plans[plan_index]
+        state_lanes = self.encode_state(state_free, state_clamp)
+        spin_values = tuple(float(state_lanes[lane]) for lane in plan.spin_lanes)
+        expected_category = evaluate_categorical_spin_plan(plan, state_lanes, gumbel)
+        expected_one_hot = tuple(1.0 if i == expected_category else 0.0 for i in range(plan.n_categories))
+        return TTLangCategoricalSpinRun(
+            plan=plan,
+            spin_values=spin_values,
+            gumbel=tuple(float(v) for v in gumbel),
+            expected_category=expected_category,
+            expected_one_hot=expected_one_hot,
         )
 
 
@@ -332,6 +388,48 @@ def build_spin_categorical_plan(layout: TTLangStateLayout, spec: FusedBlockSpec)
     )
 
 
+def build_categorical_spin_plan(layout: TTLangStateLayout, spec: FusedBlockSpec) -> TTLangCategoricalSpinPlan:
+    """Lower a simple categorical block with spin sources to a TT-Lang plan."""
+    if spec.family != Family.CATEGORICAL:
+        raise ValueError(f"expected categorical block, got {spec.family.value}")
+    if spec.n_nodes != 1:
+        raise ValueError("TT-Lang categorical spin plan currently supports one-node categorical blocks")
+    n_categories = spec.n_categories
+    if n_categories is None:
+        raise ValueError("categorical block is missing n_categories")
+
+    bias = np.zeros((n_categories,), dtype=np.float32)
+    spin_lanes: list[int] = []
+    spin_weights: list[tuple[float, ...]] = []
+
+    for interaction in spec.interactions:
+        weighted_mask = np.asarray(interaction.weighted_mask, dtype=np.float32)
+        if interaction.n_categorical:
+            raise ValueError("categorical source interactions are not yet supported by this TT-Lang plan")
+        weights = weighted_mask.reshape(interaction.n_terms, n_categories)
+        if interaction.n_spin == 0:
+            bias += weights.sum(axis=0)
+            continue
+        if interaction.n_spin != 1:
+            raise ValueError("only one spin source per interaction is currently supported")
+        if len(interaction.gather_indices) != 1:
+            raise ValueError("spin interaction must have exactly one gather index array")
+
+        gather_indices = np.asarray(interaction.gather_indices[0], dtype=np.int32).reshape(interaction.n_terms)
+        for scalar_index, term_weights in zip(gather_indices, weights, strict=True):
+            spin_lanes.append(layout.node_lane_start(int(scalar_index)))
+            spin_weights.append(tuple(float(v) for v in term_weights))
+
+    output_start = layout.node_lane_start(spec.block_global_start)
+    return TTLangCategoricalSpinPlan(
+        block_index=spec.block_index,
+        output_lanes=tuple(output_start + category for category in range(n_categories)),
+        bias=tuple(float(v) for v in bias),
+        spin_lanes=tuple(spin_lanes),
+        spin_weights=tuple(spin_weights),
+    )
+
+
 def evaluate_spin_categorical_plan(
     plan: TTLangSpinCategoricalPlan, state_lanes: np.ndarray, threshold_logit: float
 ) -> float:
@@ -343,3 +441,15 @@ def evaluate_spin_categorical_plan(
             np.dot(lanes[np.asarray(lane_group, dtype=np.int32)], np.asarray(weight_group, dtype=np.float32))
         )
     return 1.0 if (2.0 * gamma) > float(threshold_logit) else -1.0
+
+
+def evaluate_categorical_spin_plan(
+    plan: TTLangCategoricalSpinPlan, state_lanes: np.ndarray, gumbel: Sequence[float]
+) -> int:
+    """Reference evaluator for the first TT-Lang categorical/spin plan."""
+    lanes = np.asarray(state_lanes, dtype=np.float32).reshape(-1)
+    scores = np.asarray(plan.bias, dtype=np.float32)
+    for spin_lane, weight_group in zip(plan.spin_lanes, plan.spin_weights, strict=True):
+        scores = scores + lanes[spin_lane] * np.asarray(weight_group, dtype=np.float32)
+    perturbed = scores + np.asarray(gumbel, dtype=np.float32)
+    return int(perturbed.argmax())

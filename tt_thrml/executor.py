@@ -23,7 +23,6 @@ from thrml.block_sampling import BlockSamplingProgram, SamplingSchedule
 from .compiler import compile_program
 from .core import BulkRNGBuffers, CompiledProgram, Family, TTMLIRConfig
 from .rng import generate_bulk_rng, generate_bulk_rng_for_schedule, make_rng_spec, slice_rng_for_sweep
-from .ttlang_runtime import make_primary_ttlang_executor
 
 _RUNTIME_BRIDGE_NAMES = (
     "create_runtime_device_from_ttnn",
@@ -436,22 +435,6 @@ class Executor:
         if family == Family.CATEGORICAL:
             return np.round(chunk).astype(np.int32)
         return chunk.astype(np.float32)
-
-
-def make_executor(
-    ttnn,
-    device,
-    program: BlockSamplingProgram,
-    config: TTMLIRConfig | None = None,
-    *,
-    n_sweeps: int = 100,
-    profile: bool = False,
-) -> Any:
-    if n_sweeps != 100:
-        raise ValueError("the primary TT-Lang executor does not use n_sweeps; configure sweeps when running")
-    if profile:
-        raise ValueError("the primary TT-Lang executor does not use TT-MLIR profiling")
-    return make_primary_ttlang_executor(ttnn, device, program)
 
 
 def make_ttmlir_executor(

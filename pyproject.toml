@@ -1,7 +1,7 @@
 [project]
 name = "tt-thrml"
 version = "0.1.3"
-description = "Tenstorrent runtime and TT-MLIR execution layer for THRML"
+description = "Tenstorrent TT-Lang execution layer for THRML"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }

@@ -18,10 +18,6 @@ The intended API is intentionally small:
 - `tt_thrml.close_mesh_device`
 - `tt_thrml.close_devices`
 - `tt_thrml.make_executor`
-- `tt_thrml.make_ttmlir_executor`
-- `tt_thrml.TTMLIRConfig`
-- `tt_thrml.make_ttmlir_config`
-- `tt_thrml.GaussianConditional`
 
 Everything else should be treated as compiler/runtime internals.
 
@@ -31,10 +27,11 @@ Everything else should be treated as compiler/runtime internals.
 executor for the supported mixed discrete program shape and fails clearly for
 unsupported shapes instead of switching execution paths implicitly.
 
-`make_ttmlir_executor` keeps the older TT-MLIR/TTRT path available for parity
-and performance comparisons. That path compiles each THRML program once to a
-set of fused TT-MLIR flatbuffer kernels, one per THRML sampling group. A single
-sweep invokes each group kernel as:
+The older TT-MLIR/TTRT path remains available for parity and performance
+comparisons through explicit imports from `tt_thrml.core` and
+`tt_thrml.executor`. That path compiles each THRML program once to a set of
+fused TT-MLIR flatbuffer kernels, one per THRML sampling group. A single sweep
+invokes each group kernel as:
 
 ```
 (global_state, *rng_slices) -> new_global_state
@@ -95,10 +92,11 @@ j-quietbox-ttlang-primary-make-executor-bench-ifdt3v
 j-quietbox-ttlang-primary-executor-state-api-bench-ifoy44
 j-quietbox-ttlang-runtime-no-numpy-bench-ii3rtc
 j-quietbox-ttlang-public-api-cleanup-container-bench-iidn8l
+j-quietbox-ttlang-primary-api-split-bench-iis5o3
 ```
 
 The latest final-state-checked nonzero-randomness 50-sweep TT-Lang benchmark
-measured 32.08 ms total, or 0.642 ms/sweep, for the current narrow
+measured 32.18 ms total, or 0.644 ms/sweep, for the current narrow
 implementation. It still uses six dispatches per sweep, so this is a baseline
 before fusing group copy/update work.
 

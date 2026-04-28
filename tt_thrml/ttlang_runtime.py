@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import time
 from collections.abc import Mapping, Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from thrml.block_sampling import BlockSamplingProgram
 
-from .ttlang_backend import ExperimentalTTLangExecutor, decode_state
+if TYPE_CHECKING:
+    from .ttlang_backend import ExperimentalTTLangExecutor
 
 TILE = 32
 N_CATEGORIES = 3
@@ -31,7 +32,7 @@ def state_tiles(lanes: Any) -> Any:
     return tile_planes([float(value) for value in lanes])
 
 
-def validate_ttlang_discrete_runtime(executor: ExperimentalTTLangExecutor) -> None:
+def validate_ttlang_discrete_runtime(executor: "ExperimentalTTLangExecutor") -> None:
     """Validate the narrow program shape currently backed by hardware kernels."""
     if executor.layout.total_lanes != 10:
         raise ValueError(f"TT-Lang discrete runtime expects 10 lanes, got {executor.layout.total_lanes}")
@@ -58,6 +59,8 @@ def validate_ttlang_discrete_runtime(executor: ExperimentalTTLangExecutor) -> No
 
 
 def supports_ttlang_discrete_runtime(program: BlockSamplingProgram) -> bool:
+    from .ttlang_backend import ExperimentalTTLangExecutor
+
     try:
         validate_ttlang_discrete_runtime(ExperimentalTTLangExecutor(program))
     except ValueError:
@@ -66,7 +69,7 @@ def supports_ttlang_discrete_runtime(program: BlockSamplingProgram) -> bool:
 
 
 def make_ttlang_discrete_runtime(
-    *, ttl: Any, ttnn: Any, device: Any, executor: ExperimentalTTLangExecutor
+    *, ttl: Any, ttnn: Any, device: Any, executor: "ExperimentalTTLangExecutor"
 ) -> "TTLangDiscreteSweepRuntime":
     validate_ttlang_discrete_runtime(executor)
     return TTLangDiscreteSweepRuntime(ttl=ttl, ttnn=ttnn, device=device, executor=executor)
@@ -80,6 +83,8 @@ def make_primary_ttlang_executor(
     ttl_module: Any | None = None,
 ) -> "TTLangDiscreteSweepRuntime":
     """Build the primary TT-Lang executor for the currently proven program shape."""
+    from .ttlang_backend import ExperimentalTTLangExecutor
+
     executor = ExperimentalTTLangExecutor(program)
     validate_ttlang_discrete_runtime(executor)
     if ttl_module is None:
@@ -101,7 +106,7 @@ class TTLangDiscreteSweepRuntime:
 
     dispatches_per_sweep = 6
 
-    def __init__(self, *, ttl: Any, ttnn: Any, device: Any, executor: ExperimentalTTLangExecutor):
+    def __init__(self, *, ttl: Any, ttnn: Any, device: Any, executor: "ExperimentalTTLangExecutor"):
         validate_ttlang_discrete_runtime(executor)
         self.ttl = ttl
         self.ttnn = ttnn
@@ -180,6 +185,8 @@ class TTLangDiscreteSweepRuntime:
         return self.ttnn.to_torch(current).to(_torch().bfloat16)
 
     def read_state_lists(self) -> tuple[list[Any], list[Any]]:
+        from .ttlang_backend import decode_state
+
         host_state = self.materialize_state().to(_torch().float32).cpu().tolist()
         lanes = [host_state[lane * TILE][0] for lane in range(self.executor.layout.total_lanes)]
         decoded = decode_state(self.executor.layout, lanes)

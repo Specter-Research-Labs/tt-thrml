@@ -53,6 +53,9 @@ from thrml.models.discrete_ebm import (
 from thrml.pgm import AbstractNode, CategoricalNode, SpinNode
 
 import tt_thrml
+from tt_thrml.conditional_samplers import GaussianConditional
+from tt_thrml.core import make_ttmlir_config
+from tt_thrml.executor import make_ttmlir_executor
 
 # ── Custom node + interaction types (Gaussian family) ─────────────────────────
 
@@ -189,7 +192,7 @@ def _gaussian_chain() -> Demo:
     all_nodes = Block(nodes)
     program = FactorSamplingProgram(
         BlockGibbsSpec(blocks, [], sdt),
-        [tt_thrml.GaussianConditional(), tt_thrml.GaussianConditional()],
+        [GaussianConditional(), GaussianConditional()],
         [
             _linear_factor(jnp.zeros(n, dtype=jnp.float32), all_nodes),
             _quadratic_factor(jnp.full(n, 0.8, dtype=jnp.float32), all_nodes),
@@ -233,7 +236,7 @@ def _mixed_program() -> Demo:
     gauss_block = Block(gauss)
     program = FactorSamplingProgram(
         BlockGibbsSpec(blocks, [], sdt),
-        [SpinGibbsConditional(), cat_s, tt_thrml.GaussianConditional()] * n,
+        [SpinGibbsConditional(), cat_s, GaussianConditional()] * n,
         [
             SpinEBMFactor([Block(spins)], jnp.array([0.2, -0.3, 0.1], dtype=jnp.float32)),
             CategoricalEBMFactor([Block(cats)], jnp.zeros((n, c), dtype=jnp.float32).at[:, 0].set(0.2)),
@@ -286,7 +289,7 @@ def run_cpu(demo: Demo, key) -> tuple[list, float]:
 
 def run_wormhole(demo: Demo, key, *, ttnn, device, config, signpost, profile: bool = False) -> tuple[list, float]:
     signpost(header=f"compile:{demo.name}")
-    executor = tt_thrml.make_ttmlir_executor(ttnn, device, demo.program, config, profile=profile)
+    executor = make_ttmlir_executor(ttnn, device, demo.program, config, profile=profile)
 
     signpost(header=f"run:{demo.name}")
     ttnn.start_tracy_zone(__file__, demo.name, 0)
@@ -420,7 +423,7 @@ def main() -> None:
 
         ttnn = _ttnn
         artifact_root.mkdir(parents=True, exist_ok=True)
-        config = tt_thrml.make_ttmlir_config(
+        config = make_ttmlir_config(
             system_desc_path=system_desc,
             artifact_root=artifact_root,
             build_dir=build_dir,

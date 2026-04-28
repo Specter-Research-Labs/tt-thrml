@@ -19,6 +19,8 @@ from thrml.observers import MomentAccumulatorObserver
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import tt_thrml
+from tt_thrml.core import make_ttmlir_config
+from tt_thrml.executor import make_ttmlir_executor
 
 
 def build_ising_chain():
@@ -73,7 +75,7 @@ def main():
 
     try:
         print("\n--- Creating TT-MLIR config ---")
-        config = tt_thrml.make_ttmlir_config(
+        config = make_ttmlir_config(
             system_desc_path=system_desc_path,
             artifact_root=artifact_root,
             build_dir=build_dir,
@@ -82,7 +84,7 @@ def main():
 
         total_sweeps = schedule.n_warmup + schedule.n_samples * schedule.steps_per_sample
         print(f"\n--- Creating fused executor (n_sweeps={total_sweeps}) ---")
-        executor = tt_thrml.make_ttmlir_executor(ttnn, device, program, config, n_sweeps=total_sweeps)
+        executor = make_ttmlir_executor(ttnn, device, program, config, n_sweeps=total_sweeps)
         print(f"Executor created with {len(executor.compiled.blocks)} fused blocks")
 
         for i, block in enumerate(executor.compiled.blocks):

@@ -45,6 +45,7 @@ is lowered into TT-Lang lanes:
 ## Quick Start
 
 ```python
+import jax
 import ttnn
 
 import tt_thrml
@@ -57,10 +58,7 @@ device = tt_thrml.open_device(ttnn, device_id=0)
 try:
     executor = tt_thrml.make_executor(ttnn, device, program)
     executor.load_state(initial_state)
-    executor.set_sweep_randomness(
-        spin_threshold_logits={0: 0.0, 3: 0.0},
-        categorical_gumbel={1: [0.0, 0.0, 0.0], 4: [0.0, 0.0, 0.0]},
-    )
+    executor.set_sweep_randomness_window_from_key(jax.random.PRNGKey(0), 50)
     executor.run_sweeps(50)
     free_state, clamped_state = executor.read_state_lists()
 finally:
@@ -98,23 +96,25 @@ podman run -d --privileged --network host --name tt-lang-codex \
 Current cleanup HEAD passed on QuietBox:
 
 ```text
-j-quietbox-ttlang-inplace-group-bench-iqvgem
+j-quietbox-ttlang-window-steady-bench-irofxo
 PASS: TT-Lang THRML discrete sweep
 2 warmup sweeps, 10 measured sweeps
-3.47 ms total, 0.347 ms/sweep, 2 dispatches/sweep
+3.90 ms total, 0.390 ms/sweep, 2 dispatches/sweep
 ```
 
-The prior copy-based 2-dispatch runtime measured 3.51 ms total,
-0.351 ms/sweep. The prior 6-dispatch runtime measured 6.99 ms total,
-0.699 ms/sweep on the same 2-warmup/10-measured QuietBox benchmark.
+The prior fixed-randomness in-place runtime measured 3.47 ms total,
+0.347 ms/sweep. The prior copy-based 2-dispatch runtime measured 3.51 ms
+total, 0.351 ms/sweep. The prior 6-dispatch runtime measured 6.99 ms total,
+0.699 ms/sweep on the same QuietBox benchmark shape.
 
 ## Randomness
 
-The runtime accepts explicit per-block random inputs for deterministic tests,
-and it can derive those inputs from a JAX key using THRML's own schedule:
+The runtime accepts explicit per-block random inputs for deterministic tests.
+For chain runs, prefer a device-resident randomness window derived from a JAX
+key using THRML's own schedule:
 
 ```python
-runtime.set_sweep_randomness_from_key(jax.random.PRNGKey(0))
+runtime.set_sweep_randomness_window_from_key(jax.random.PRNGKey(0), n_sweeps)
 ```
 
 This mirrors THRML's per-sweep block-key split and sampler-key split. Spin

@@ -69,9 +69,11 @@ The current runner exposes deterministic per-block inputs:
 - spin threshold logits
 - categorical Gumbel values
 
-Those constants are uploaded to device tensors before sweeps. They can also be
-derived from a JAX key with `TTLangProgramPlanner.sweep_randomness_from_key` or
-`TTLangDiscreteSweepRuntime.set_sweep_randomness_from_key`.
+Single-sweep constants are uploaded to device tensors before sweeps. Chain runs
+use `TTLangProgramPlanner.sweep_randomness_window_from_key` or
+`TTLangDiscreteSweepRuntime.set_sweep_randomness_window_from_key` to upload the
+full THRML randomness schedule once and keep it device-resident while sweeps
+advance.
 
 The key derivation matches THRML's one-sweep sampling path:
 
@@ -80,9 +82,10 @@ The key derivation matches THRML's one-sweep sampling path:
 3. use the first sampler subkey for the Bernoulli or categorical draw
 
 For TT-Lang, Bernoulli draws are represented as logit thresholds and categorical
-draws are represented as Gumbel-max perturbations. The next runtime step is to
-batch full sweep windows in device-resident randomness buffers rather than
-replacing constants one sweep at a time.
+draws are represented as Gumbel-max perturbations. The current runtime selects
+window rows with cached TT-Lang operations; the next optimization is to consume
+an entire sweep window inside one group kernel so a long chain does not need one
+host dispatch per sweep.
 
 ## Device Ownership
 

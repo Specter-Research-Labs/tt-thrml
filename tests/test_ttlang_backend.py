@@ -19,6 +19,7 @@ from tt_thrml.ttlang_backend import (
     expand_categorical_gather_lanes,
     make_chain_sweep_randomness_from_key,
     make_sweep_randomness_from_key,
+    make_sweep_randomness_window_from_key,
 )
 from tt_thrml.ttlang_runtime import supports_ttlang_discrete_runtime, validate_ttlang_discrete_runtime
 
@@ -287,6 +288,53 @@ def test_ttlang_sweep_randomness_follows_thrml_key_schedule():
     chain_randomness = make_chain_sweep_randomness_from_key(executor, key, sweep_index=2, n_sweeps=5)
     direct_randomness = make_sweep_randomness_from_key(executor, jax.random.split(key, 5)[2])
     assert chain_randomness == direct_randomness
+
+
+def test_ttlang_sweep_randomness_window_matches_thrml_chain_schedule():
+    import jax
+
+    executor = TTLangProgramPlanner(make_mixed_spin_categorical_gaussian_program())
+    key = jax.random.PRNGKey(23)
+    n_sweeps = 5
+
+    window = make_sweep_randomness_window_from_key(executor, key, n_sweeps)
+
+    assert window.n_sweeps == n_sweeps
+    for sweep_index in range(n_sweeps):
+        assert window.sweep(sweep_index) == make_chain_sweep_randomness_from_key(
+            executor, key, sweep_index=sweep_index, n_sweeps=n_sweeps
+        )
+
+
+def test_ttlang_reference_sweeps_can_consume_randomness_window():
+    import jax
+
+    executor = TTLangProgramPlanner(make_mixed_spin_categorical_gaussian_program())
+    state_lanes = executor.encode_state(
+        [
+            np.asarray([True]),
+            np.asarray([1], dtype=np.uint8),
+            np.asarray([0.25], dtype=np.float32),
+            np.asarray([False]),
+            np.asarray([1], dtype=np.uint8),
+            np.asarray([-0.75], dtype=np.float32),
+        ]
+    )
+    window = executor.sweep_randomness_window_from_key(jax.random.PRNGKey(29), 4)
+
+    expected = state_lanes
+    for sweep_index in range(window.n_sweeps):
+        randomness = window.sweep(sweep_index)
+        expected = executor.evaluate_discrete_sweep(
+            expected,
+            spin_threshold_logits=dict(randomness.spin_threshold_logits),
+            categorical_gumbel=dict(randomness.categorical_gumbel),
+        )
+
+    np.testing.assert_array_equal(
+        executor.evaluate_discrete_sweeps_with_randomness_window(state_lanes, window),
+        expected,
+    )
 
 
 def test_ttlang_runtime_support_boundary_accepts_only_proven_discrete_shape():

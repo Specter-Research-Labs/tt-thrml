@@ -122,6 +122,29 @@ class TTLangSweepRandomness:
 
 
 @dataclass(frozen=True)
+class TTLangSweepRandomnessWindow:
+    """Ordered per-sweep random inputs for a THRML chain run."""
+
+    n_sweeps: int
+    spin_threshold_logits: Mapping[int, tuple[float, ...]]
+    categorical_gumbel: Mapping[int, tuple[tuple[float, ...], ...]]
+
+    def sweep(self, sweep_index: int) -> TTLangSweepRandomness:
+        if sweep_index < 0:
+            raise ValueError("sweep_index must be non-negative")
+        if sweep_index >= self.n_sweeps:
+            raise ValueError("sweep_index must be less than n_sweeps")
+        return TTLangSweepRandomness(
+            spin_threshold_logits={
+                block_index: values[sweep_index] for block_index, values in self.spin_threshold_logits.items()
+            },
+            categorical_gumbel={
+                block_index: values[sweep_index] for block_index, values in self.categorical_gumbel.items()
+            },
+        )
+
+
+@dataclass(frozen=True)
 class _GlobalStateLayout:
     block_starts: tuple[int, ...]
     global_to_flat: tuple[tuple[int, ...], ...]
@@ -263,6 +286,21 @@ class TTLangProgramPlanner:
             )
         return current
 
+    def evaluate_discrete_sweeps_with_randomness_window(
+        self,
+        state_lanes: np.ndarray,
+        randomness_window: TTLangSweepRandomnessWindow,
+    ) -> np.ndarray:
+        current = np.asarray(state_lanes, dtype=np.float32).reshape(-1).copy()
+        for sweep_index in range(randomness_window.n_sweeps):
+            randomness = randomness_window.sweep(sweep_index)
+            current = self.evaluate_discrete_sweep(
+                current,
+                spin_threshold_logits=dict(randomness.spin_threshold_logits),
+                categorical_gumbel=dict(randomness.categorical_gumbel),
+            )
+        return current
+
     def sweep_randomness_from_key(self, key: Any) -> TTLangSweepRandomness:
         """Generate TT-Lang runtime randomness using THRML's per-sweep key schedule.
 
@@ -273,6 +311,9 @@ class TTLangProgramPlanner:
         perturbations for `jax.random.categorical`.
         """
         return make_sweep_randomness_from_key(self, key)
+
+    def sweep_randomness_window_from_key(self, key: Any, n_sweeps: int) -> TTLangSweepRandomnessWindow:
+        return make_sweep_randomness_window_from_key(self, key, n_sweeps)
 
 
 def _as_spec(block_or_spec: CompiledFusedBlock | FusedBlockSpec) -> FusedBlockSpec:
@@ -796,3 +837,31 @@ def make_chain_sweep_randomness_from_key(
     import jax
 
     return make_sweep_randomness_from_key(executor, jax.random.split(key, n_sweeps)[sweep_index])
+
+
+def make_sweep_randomness_window_from_key(
+    executor: TTLangProgramPlanner, key: Any, n_sweeps: int
+) -> TTLangSweepRandomnessWindow:
+    """Generate a full THRML scanned-chain randomness window."""
+    if n_sweeps < 0:
+        raise ValueError("n_sweeps must be non-negative")
+
+    import jax
+
+    sweep_keys = jax.random.split(key, n_sweeps)
+    sweeps = tuple(make_sweep_randomness_from_key(executor, sweep_key) for sweep_key in sweep_keys)
+    spin_threshold_logits = {
+        plan.block_index: tuple(float(sweep.spin_threshold_logits[plan.block_index]) for sweep in sweeps)
+        for plan in executor.spin_categorical_plans
+    }
+    categorical_gumbel = {
+        plan.block_index: tuple(
+            tuple(float(value) for value in sweep.categorical_gumbel[plan.block_index]) for sweep in sweeps
+        )
+        for plan in executor.categorical_spin_plans
+    }
+    return TTLangSweepRandomnessWindow(
+        n_sweeps=n_sweeps,
+        spin_threshold_logits=spin_threshold_logits,
+        categorical_gumbel=categorical_gumbel,
+    )

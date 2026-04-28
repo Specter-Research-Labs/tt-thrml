@@ -116,6 +116,8 @@ class TTLangDiscreteSweepRuntime:
 
         spin_plans = {plan.block_index: plan for plan in executor.spin_categorical_plans}
         categorical_plans = {plan.block_index: plan for plan in executor.categorical_spin_plans}
+        self.spin_plans = spin_plans
+        self.categorical_plans = categorical_plans
         self.groups = _make_runtime_groups(executor, spin_plans, categorical_plans)
         self.operations = _define_operations(
             ttl,
@@ -123,8 +125,11 @@ class TTLangDiscreteSweepRuntime:
             categorical_plans,
             groups=self.groups,
         )
+        self.window_operations: dict[int, _Operations] = {}
         self.constants = self._make_constants(spin_plans, categorical_plans)
         self._state_current: Any | None = None
+        self._randomness_window_length: int | None = None
+        self._randomness_cursor = 0
 
     def upload_state(self, lanes: Any) -> None:
         self._state_current = self.from_torch(state_tiles(lanes))
@@ -140,6 +145,8 @@ class TTLangDiscreteSweepRuntime:
     ) -> None:
         """Upload deterministic per-block random inputs for the next sweeps."""
         torch = _torch()
+        self._randomness_window_length = None
+        self._randomness_cursor = 0
         spin_threshold_logits = spin_threshold_logits or {}
         categorical_gumbel = categorical_gumbel or {}
 
@@ -175,9 +182,70 @@ class TTLangDiscreteSweepRuntime:
             categorical_gumbel=randomness.categorical_gumbel,
         )
 
+    def set_sweep_randomness_window(self, randomness_window: Any) -> None:
+        """Upload a device-resident THRML randomness window for subsequent sweeps."""
+        if randomness_window.n_sweeps <= 0:
+            raise ValueError("randomness window must contain at least one sweep")
+
+        spin_blocks = {plan.block_index for plan in self.executor.spin_categorical_plans}
+        categorical_blocks = {plan.block_index for plan in self.executor.categorical_spin_plans}
+
+        unsupported_spin_blocks = set(randomness_window.spin_threshold_logits) - spin_blocks
+        if unsupported_spin_blocks:
+            raise ValueError(f"unsupported TT-Lang spin threshold blocks: {tuple(sorted(unsupported_spin_blocks))}")
+        unsupported_categorical_blocks = set(randomness_window.categorical_gumbel) - categorical_blocks
+        if unsupported_categorical_blocks:
+            raise ValueError(
+                f"unsupported TT-Lang categorical gumbel blocks: {tuple(sorted(unsupported_categorical_blocks))}"
+            )
+
+        for block_index in sorted(spin_blocks):
+            values = tuple(
+                float(value)
+                for value in randomness_window.spin_threshold_logits.get(
+                    block_index, (0.0,) * randomness_window.n_sweeps
+                )
+            )
+            if len(values) != randomness_window.n_sweeps:
+                raise ValueError(f"TT-Lang spin threshold block {block_index} has the wrong window length")
+            self.constants[_spin_key(block_index, "threshold")] = self.from_torch(tile_planes(list(values)))
+
+        for block_index in sorted(categorical_blocks):
+            sweeps = tuple(
+                tuple(float(value) for value in values)
+                for values in randomness_window.categorical_gumbel.get(
+                    block_index, ((0.0, 0.0, 0.0),) * randomness_window.n_sweeps
+                )
+            )
+            if len(sweeps) != randomness_window.n_sweeps:
+                raise ValueError(f"TT-Lang categorical gumbel block {block_index} has the wrong window length")
+            for values in sweeps:
+                if len(values) != N_CATEGORIES:
+                    raise ValueError(f"TT-Lang categorical gumbel block {block_index} expects {N_CATEGORIES} values")
+            self.constants[_categorical_key(block_index, "gumbel")] = self.from_torch(
+                tile_planes([value for values in sweeps for value in values])
+            )
+
+        self._randomness_window_length = int(randomness_window.n_sweeps)
+        self._randomness_cursor = 0
+
+    def set_sweep_randomness_window_from_key(self, key: Any, n_sweeps: int) -> None:
+        self.set_sweep_randomness_window(self.executor.sweep_randomness_window_from_key(key, n_sweeps))
+
+    def rewind_sweep_randomness_window(self) -> None:
+        if self._randomness_window_length is None:
+            raise RuntimeError("no randomness window is loaded")
+        self._randomness_cursor = 0
+
     def run_sweep(self) -> None:
         current = self._require_state()
-        self._run_discrete_sweep(current)
+        if self._randomness_window_length is None:
+            self._run_discrete_sweep(current)
+            return
+        if self._randomness_cursor >= self._randomness_window_length:
+            raise RuntimeError("randomness window is exhausted")
+        self._run_discrete_sweep(current, window_slot=self._randomness_cursor)
+        self._randomness_cursor += 1
 
     def run_sweeps(self, n_sweeps: int) -> float:
         if n_sweeps <= 0:
@@ -238,8 +306,8 @@ class TTLangDiscreteSweepRuntime:
             constants[_categorical_key(block_index, "bias")] = self.from_torch(tile_planes(list(plan.bias)))
         return constants
 
-    def _run_discrete_sweep(self, state: Any) -> None:
-        ops = self.operations
+    def _run_discrete_sweep(self, state: Any, *, window_slot: int | None = None) -> None:
+        ops = self.operations if window_slot is None else self._operations_for_window_slot(window_slot)
         constants = self.constants
         for group_index, group in enumerate(self.groups):
             spin_block = _require_block(group.spin_block, "spin", group)
@@ -256,6 +324,19 @@ class TTLangDiscreteSweepRuntime:
                 constants["half"],
                 state,
             )
+
+    def _operations_for_window_slot(self, window_slot: int) -> _Operations:
+        operations = self.window_operations.get(window_slot)
+        if operations is None:
+            operations = _define_operations(
+                self.ttl,
+                self.spin_plans,
+                self.categorical_plans,
+                groups=self.groups,
+                window_slot=window_slot,
+            )
+            self.window_operations[window_slot] = operations
+        return operations
 
     def _require_state(self) -> Any:
         if self._state_current is None:
@@ -332,9 +413,12 @@ def _define_operations(
     categorical_plans: dict[int, Any],
     *,
     groups: tuple[_RuntimeGroup, ...],
+    window_slot: int | None = None,
 ) -> _Operations:
     global ttl
     ttl = ttl_module
+    threshold_row = 0 if window_slot is None else window_slot
+    gumbel_row_start = 0 if window_slot is None else window_slot * N_CATEGORIES
 
     def define_group_update(
         *,
@@ -442,7 +526,7 @@ def _define_operations(
                         tx_state.wait()
                         tx_weights.wait()
                 with threshold_dfb.reserve() as threshold_blk:
-                    tx_threshold = ttl.copy(threshold_logits[0, 0], threshold_blk)
+                    tx_threshold = ttl.copy(threshold_logits[threshold_row, 0], threshold_blk)
                     tx_threshold.wait()
                 with spin_half_dfb.reserve() as half_blk:
                     tx_half = ttl.copy(half[0, 0], half_blk)
@@ -459,7 +543,7 @@ def _define_operations(
                         tx_bias = ttl.copy(categorical_bias[category, 0], bias_blk)
                         tx_bias.wait()
                     with gumbel_dfb.reserve() as gumbel_blk:
-                        tx_gumbel = ttl.copy(gumbel[category, 0], gumbel_blk)
+                        tx_gumbel = ttl.copy(gumbel[gumbel_row_start + category, 0], gumbel_blk)
                         tx_gumbel.wait()
                 with one_dfb.reserve() as one_blk:
                     tx_one = ttl.copy(one[0, 0], one_blk)

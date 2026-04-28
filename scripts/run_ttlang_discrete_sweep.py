@@ -64,28 +64,26 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--benchmark", type=int, default=0, metavar="N", help="run N timed device-resident sweeps")
     parser.add_argument("--warmup", type=int, default=0, metavar="N", help="run N untimed sweeps before benchmarking")
+    parser.add_argument("--seed", type=int, default=0, help="JAX PRNG seed for the THRML chain randomness window")
     parser.add_argument("--json", action="store_true", help="emit the benchmark record as JSON")
     args = parser.parse_args()
+
+    import jax
 
     ttnn = _require_ttnn()
     program = make_mixed_spin_categorical_gaussian_program()
     executor = TTLangProgramPlanner(program)
     initial_state = _initial_state()
     initial_lanes = executor.encode_state(initial_state)
-    sweep_kwargs = {
-        "spin_threshold_logits": {0: -0.1, 3: 0.2},
-        "categorical_gumbel": {1: (0.0, 2.0, 0.0), 4: (0.0, 0.0, 1.0)},
-    }
-    expected_lanes = executor.evaluate_discrete_sweep(
-        initial_lanes,
-        **sweep_kwargs,
-    )
+    total_sweeps = max(1, int(args.benchmark), 1 + max(0, int(args.warmup)))
+    randomness_window = executor.sweep_randomness_window_from_key(jax.random.PRNGKey(args.seed), total_sweeps)
+    expected_lanes = executor.evaluate_discrete_sweep(initial_lanes, **randomness_window.sweep(0).as_kwargs())
 
     device = ttnn.open_device(device_id=0)
     try:
         runtime = tt_thrml.make_executor(ttnn, device, program)
         runtime.load_state(initial_state)
-        runtime.set_sweep_randomness(**sweep_kwargs)
+        runtime.set_sweep_randomness_window(randomness_window)
         runtime.run_sweep()
 
         result = runtime.materialize_state()
@@ -102,11 +100,17 @@ def main() -> None:
             warmup = int(args.warmup)
             if warmup < 0:
                 raise ValueError("--warmup must be non-negative")
-            if warmup:
-                runtime.run_sweeps(warmup)
-                expected_lanes = executor.evaluate_discrete_sweeps(expected_lanes, warmup, **sweep_kwargs)
+            runtime.load_state(initial_state)
+            runtime.rewind_sweep_randomness_window()
+            precompile_sweeps = max(warmup, n)
+            runtime.run_sweeps(precompile_sweeps)
+            runtime.load_state(initial_state)
+            runtime.rewind_sweep_randomness_window()
             elapsed_ms = runtime.run_sweeps(n)
-            expected_after_benchmark = executor.evaluate_discrete_sweeps(expected_lanes, n, **sweep_kwargs)
+            benchmark_window = executor.sweep_randomness_window_from_key(jax.random.PRNGKey(args.seed), n)
+            expected_after_benchmark = executor.evaluate_discrete_sweeps_with_randomness_window(
+                initial_lanes, benchmark_window
+            )
             expected_state_after_benchmark = decode_state(executor.layout, expected_after_benchmark)
             decoded_after_benchmark, decoded_clamp_after_benchmark = runtime.read_state_lists()
             _assert_tiles_equal(runtime.materialize_state(), expected_after_benchmark, label=f"{n + 1} sweeps")

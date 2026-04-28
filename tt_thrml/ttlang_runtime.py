@@ -90,10 +90,10 @@ class TTLangDiscreteSweepRuntime:
         self.ttnn = ttnn
         self.device = device
         self.executor = executor
-        self.operations = _define_operations(ttl)
 
         spin_plans = {plan.block_index: plan for plan in executor.spin_categorical_plans}
         categorical_plans = {plan.block_index: plan for plan in executor.categorical_spin_plans}
+        self.operations = _define_operations(ttl, spin_plans, categorical_plans)
         self.constants = self._make_constants(spin_plans, categorical_plans)
         self._state_current: Any | None = None
         self._state_mid: Any | None = None
@@ -249,7 +249,7 @@ class _Operations:
         self.categorical_group1 = categorical_group1
 
 
-def _define_operations(ttl_module: Any) -> _Operations:
+def _define_operations(ttl_module: Any, spin_plans: dict[int, Any], categorical_plans: dict[int, Any]) -> _Operations:
     global ttl
     ttl = ttl_module
 
@@ -417,8 +417,20 @@ def _define_operations(ttl_module: Any) -> _Operations:
 
     return _Operations(
         copy_state_10=copy_state_10,
-        spin_group0=define_spin_update(source_start=1, output_lane=0),
-        categorical_group0=define_categorical_update(source_lane=0, output_start=1),
-        spin_group1=define_spin_update(source_start=6, output_lane=5),
-        categorical_group1=define_categorical_update(source_lane=5, output_start=6),
+        spin_group0=define_spin_update(
+            source_start=spin_plans[0].categorical_lane_groups[0][0],
+            output_lane=spin_plans[0].output_lane,
+        ),
+        categorical_group0=define_categorical_update(
+            source_lane=categorical_plans[1].spin_lanes[0],
+            output_start=categorical_plans[1].output_lanes[0],
+        ),
+        spin_group1=define_spin_update(
+            source_start=spin_plans[3].categorical_lane_groups[0][0],
+            output_lane=spin_plans[3].output_lane,
+        ),
+        categorical_group1=define_categorical_update(
+            source_lane=categorical_plans[4].spin_lanes[0],
+            output_start=categorical_plans[4].output_lanes[0],
+        ),
     )

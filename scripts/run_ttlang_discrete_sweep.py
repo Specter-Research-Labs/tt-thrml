@@ -14,7 +14,7 @@ sys.path.insert(0, str(REPO_ROOT))
 
 import tt_thrml
 from tt_thrml.example_programs import make_mixed_spin_categorical_gaussian_program
-from tt_thrml.ttlang_backend import ExperimentalTTLangExecutor
+from tt_thrml.ttlang_backend import ExperimentalTTLangExecutor, decode_state
 from tt_thrml.ttlang_runtime import state_tiles
 
 
@@ -48,6 +48,13 @@ def _assert_tiles_equal(result, expected_lanes: np.ndarray, *, label: str) -> No
     raise AssertionError(f"TT-Lang discrete sweep mismatch after {label}")
 
 
+def _assert_state_lists_equal(result: list[np.ndarray], expected: list[np.ndarray], *, label: str) -> None:
+    if len(result) != len(expected):
+        raise AssertionError(f"TT-Lang decoded state length mismatch after {label}: {len(result)} != {len(expected)}")
+    for index, (got, want) in enumerate(zip(result, expected, strict=True)):
+        np.testing.assert_array_equal(got, want, err_msg=f"{label} block {index}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--benchmark", type=int, default=0, metavar="N", help="run N timed device-resident sweeps")
@@ -56,7 +63,8 @@ def main() -> None:
     ttnn = _require_ttnn()
     program = make_mixed_spin_categorical_gaussian_program()
     executor = ExperimentalTTLangExecutor(program)
-    initial_lanes = executor.encode_state(_initial_state())
+    initial_state = _initial_state()
+    initial_lanes = executor.encode_state(initial_state)
     sweep_kwargs = {
         "spin_threshold_logits": {0: -0.1, 3: 0.2},
         "categorical_gumbel": {1: (0.0, 2.0, 0.0), 4: (0.0, 0.0, 1.0)},
@@ -69,21 +77,31 @@ def main() -> None:
     device = ttnn.open_device(device_id=0)
     try:
         runtime = tt_thrml.make_executor(ttnn, device, program)
-        runtime.upload_state(initial_lanes)
+        runtime.load_state(initial_state)
         runtime.set_sweep_randomness(**sweep_kwargs)
         runtime.run_sweep()
 
         result = runtime.materialize_state()
+        decoded_result, decoded_clamp = runtime.read_state_lists()
+        expected_state = decode_state(executor.layout, expected_lanes)
         print("result", result)
         print("expected", state_tiles(expected_lanes))
         _assert_tiles_equal(result, expected_lanes, label="one sweep")
+        _assert_state_lists_equal(decoded_result + decoded_clamp, expected_state, label="one sweep")
         print("PASS: TT-Lang THRML discrete sweep")
 
         if args.benchmark:
             n = int(args.benchmark)
             elapsed_ms = runtime.run_sweeps(n)
             expected_after_benchmark = executor.evaluate_discrete_sweeps(expected_lanes, n, **sweep_kwargs)
+            expected_state_after_benchmark = decode_state(executor.layout, expected_after_benchmark)
+            decoded_after_benchmark, decoded_clamp_after_benchmark = runtime.read_state_lists()
             _assert_tiles_equal(runtime.materialize_state(), expected_after_benchmark, label=f"{n + 1} sweeps")
+            _assert_state_lists_equal(
+                decoded_after_benchmark + decoded_clamp_after_benchmark,
+                expected_state_after_benchmark,
+                label=f"{n + 1} sweeps",
+            )
             print(
                 "benchmark",
                 {

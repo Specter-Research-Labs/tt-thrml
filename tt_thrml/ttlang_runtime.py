@@ -181,7 +181,13 @@ class TTLangDiscreteSweepRuntime:
         return self.ttnn.to_torch(current).to(_torch().bfloat16)
 
     def read_state_lists(self) -> tuple[list[Any], list[Any]]:
-        lanes = self.materialize_state().cpu().numpy().reshape(self.executor.layout.total_lanes, TILE, TILE)[:, 0, 0]
+        lanes = (
+            self.materialize_state()
+            .to(_torch().float32)
+            .cpu()
+            .numpy()
+            .reshape(self.executor.layout.total_lanes, TILE, TILE)[:, 0, 0]
+        )
         decoded = decode_state(self.executor.layout, lanes.astype(np.float32))
         n_free = len(self.executor.program.gibbs_spec.free_blocks)
         return list(decoded[:n_free]), list(decoded[n_free:])

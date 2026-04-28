@@ -94,10 +94,11 @@ j-quietbox-ttlang-discrete-runtime-support-boundary-bench-iere11
 j-quietbox-ttlang-discrete-runtime-randomness-bench-ieu9sz
 j-quietbox-ttlang-discrete-runtime-plan-derived-kernels-b-if69dh
 j-quietbox-ttlang-primary-make-executor-bench-ifdt3v
+j-quietbox-ttlang-primary-executor-state-api-bench-ifoy44
 ```
 
 The latest final-state-checked nonzero-randomness 50-sweep TT-Lang benchmark
-measured 32.23 ms total, or 0.645 ms/sweep, for the current narrow
+measured 32.51 ms total, or 0.650 ms/sweep, for the current narrow
 implementation. It still uses six dispatches per sweep, so this is a baseline
 before fusing group copy/update work.
 

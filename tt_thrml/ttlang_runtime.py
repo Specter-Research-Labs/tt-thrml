@@ -45,40 +45,38 @@ class TTLangDiscreteSweepRuntime:
         spin_plans = {plan.block_index: plan for plan in executor.spin_categorical_plans}
         categorical_plans = {plan.block_index: plan for plan in executor.categorical_spin_plans}
         self.constants = self._make_constants(spin_plans, categorical_plans)
-        self._state_in: Any | None = None
+        self._state_current: Any | None = None
         self._state_mid: Any | None = None
-        self._state_out: Any | None = None
+        self._state_next: Any | None = None
 
     def upload_state(self, lanes: np.ndarray) -> None:
-        self._state_in = self.from_torch(state_tiles(lanes))
+        self._state_current = self.from_torch(state_tiles(lanes))
         self._state_mid = self.from_torch(
             torch.zeros((self.executor.layout.total_lanes * TILE, TILE), dtype=torch.bfloat16)
         )
-        self._state_out = self.from_torch(
+        self._state_next = self.from_torch(
             torch.zeros((self.executor.layout.total_lanes * TILE, TILE), dtype=torch.bfloat16)
         )
 
     def run_sweep(self) -> None:
-        state_in, state_mid, state_out = self._require_state()
-        self._run_discrete_sweep(state_in, state_mid, state_out)
+        current, mid, next_state = self._require_state()
+        self._run_discrete_sweep(current, mid, next_state)
+        self._state_current, self._state_next = next_state, current
 
     def run_sweeps(self, n_sweeps: int) -> float:
         if n_sweeps <= 0:
             raise ValueError("n_sweeps must be positive")
-        state_in, state_mid, state_out = self._require_state()
+        self._require_state()
         self.ttnn.synchronize_device(self.device)
         t0 = time.perf_counter()
-        src, mid, dst = state_out, state_mid, state_in
         for _ in range(n_sweeps):
-            self._run_discrete_sweep(src, mid, dst)
-            src, dst = dst, src
+            self.run_sweep()
         self.ttnn.synchronize_device(self.device)
-        self._state_in, self._state_mid, self._state_out = dst, mid, src
         return (time.perf_counter() - t0) * 1000.0
 
     def materialize_state(self) -> torch.Tensor:
-        _, _, state_out = self._require_state()
-        return self.ttnn.to_torch(state_out).to(torch.bfloat16)
+        current, _, _ = self._require_state()
+        return self.ttnn.to_torch(current).to(torch.bfloat16)
 
     def from_torch(self, tensor: torch.Tensor):
         return self.ttnn.from_torch(
@@ -148,9 +146,9 @@ class TTLangDiscreteSweepRuntime:
         )
 
     def _require_state(self) -> tuple[Any, Any, Any]:
-        if self._state_in is None or self._state_mid is None or self._state_out is None:
+        if self._state_current is None or self._state_mid is None or self._state_next is None:
             raise RuntimeError("state must be uploaded before running TT-Lang sweeps")
-        return self._state_in, self._state_mid, self._state_out
+        return self._state_current, self._state_mid, self._state_next
 
 
 class _Operations:

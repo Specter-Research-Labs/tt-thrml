@@ -22,7 +22,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
 from tt_thrml.example_programs import make_mixed_spin_categorical_gaussian_program
-from tt_thrml.ttlang_backend import ExperimentalTTLangExecutor, TTLangSpinCategoricalRun
+from tt_thrml.ttlang_backend import TTLangProgramPlanner, TTLangSpinCategoricalRun
 
 TILE = 32
 N_CATEGORIES = 3
@@ -157,7 +157,7 @@ def _run_case(device, run: TTLangSpinCategoricalRun) -> None:
 
 
 def main() -> None:
-    executor = ExperimentalTTLangExecutor(make_mixed_spin_categorical_gaussian_program())
+    executor = TTLangProgramPlanner(make_mixed_spin_categorical_gaussian_program())
 
     device = ttnn.open_device(device_id=0)
     try:

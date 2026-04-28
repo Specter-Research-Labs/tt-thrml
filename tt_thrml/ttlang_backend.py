@@ -1,9 +1,4 @@
-"""TT-Lang-oriented state layout for THRML programs.
-
-The existing TT-MLIR backend stores every THRML node in a flat scalar vector.
-That shape is convenient for StableHLO gather/update lowering, but it is the
-wrong device contract for TT-Lang categorical work. TT-Lang wants the data
-already laid out as tiled arithmetic operands.
+"""TT-Lang-oriented lowering and state layout for THRML programs.
 
 This module defines the backend-facing logical layout:
 
@@ -23,7 +18,7 @@ from typing import Any, Iterable, Sequence
 import numpy as np
 from thrml.block_sampling import BlockSamplingProgram
 
-from .core import CompiledFusedBlock, Family, FusedBlockSpec
+from .core import CompiledFusedBlock, Family, FusedBlockSpec, FusedInteractionSpec
 
 
 @dataclass(frozen=True)
@@ -112,14 +107,22 @@ class TTLangCategoricalSpinRun:
     expected_one_hot: tuple[float, ...]
 
 
-class ExperimentalTTLangExecutor:
-    """Planning shell for the first TT-Lang executor path.
+@dataclass(frozen=True)
+class _GlobalStateLayout:
+    block_starts: tuple[int, ...]
+    global_to_flat: tuple[tuple[int, ...], ...]
+    total_nodes: int
 
-    This class does not claim full THRML execution. It captures the shared
-    pieces a real TT-Lang executor needs first: THRML block lowering,
-    family-specific state encoding, and supported spin/categorical-source
-    plan materialization.
-    """
+    def flatten_slices(self, global_inds, global_slices) -> tuple[np.ndarray, ...]:
+        flat_slices = []
+        for global_ind, global_slice in zip(global_inds, global_slices, strict=True):
+            index_map = np.asarray(self.global_to_flat[int(global_ind)], dtype=np.int32)
+            flat_slices.append(index_map[np.asarray(global_slice, dtype=np.int32)])
+        return tuple(flat_slices)
+
+
+class TTLangProgramPlanner:
+    """Lower a THRML program into the currently hardware-proven TT-Lang shape."""
 
     def __init__(self, program: BlockSamplingProgram):
         self.program = program
@@ -196,8 +199,8 @@ class ExperimentalTTLangExecutor:
         """Evaluate one supported TT-Lang discrete sweep on backend state lanes.
 
         Each sampling group reads a pre-group state snapshot and commits all
-        supported spin/categorical updates together. Unsupported gaussian lanes
-        are preserved by this narrow executor shell.
+        supported spin/categorical updates together. Gaussian lanes are
+        preserved until the TT-Lang gaussian kernel lands.
         """
         current = np.asarray(state_lanes, dtype=np.float32).reshape(-1).copy()
         if current.shape[0] != self.layout.total_lanes:
@@ -251,9 +254,227 @@ def _as_spec(block_or_spec: CompiledFusedBlock | FusedBlockSpec) -> FusedBlockSp
     return block_or_spec.spec if isinstance(block_or_spec, CompiledFusedBlock) else block_or_spec
 
 
+def _infer_family(block, gibbs_spec) -> Family:
+    node_type = type(block.nodes[0]).__name__.lower()
+    if "spin" in node_type or "bool" in node_type:
+        return Family.SPIN
+    if "categorical" in node_type or "discrete" in node_type:
+        return Family.CATEGORICAL
+    if "gaussian" in node_type or "continuous" in node_type:
+        return Family.GAUSSIAN
+    sd = gibbs_spec.node_shape_dtypes.get(type(block.nodes[0]))
+    if sd is not None:
+        dtype_kind = np.dtype(sd[0][0].dtype).kind
+        if dtype_kind == "b":
+            return Family.SPIN
+        if dtype_kind in ("i", "u"):
+            return Family.CATEGORICAL
+        if dtype_kind == "f":
+            return Family.GAUSSIAN
+    return Family.SPIN
+
+
+def _get_n_categories(block, family: Family) -> int | None:
+    if family != Family.CATEGORICAL:
+        return None
+    n_categories = getattr(block.nodes[0], "n_categories", None)
+    if n_categories is not None:
+        return int(n_categories)
+    return 2
+
+
+def _lower_interaction(interaction, family: Family) -> dict:
+    hook = getattr(interaction, "tt_interaction_contribution", None)
+    if callable(hook):
+        contrib = hook(parameter_family=family.value)
+        return {
+            "weights": np.asarray(getattr(contrib, "weights")),
+            "n_spin": int(getattr(contrib, "n_spin")),
+            "n_categorical": getattr(contrib, "n_categorical", None),
+            "contribution_kind": str(getattr(contrib, "contribution_kind", "default")),
+        }
+    if hasattr(interaction, "n_spin") and hasattr(interaction, "weights"):
+        return {
+            "weights": np.asarray(getattr(interaction, "weights")),
+            "n_spin": int(getattr(interaction, "n_spin")),
+            "n_categorical": None,
+            "contribution_kind": "default",
+        }
+    if family == Family.GAUSSIAN:
+        if hasattr(interaction, "weights"):
+            return {
+                "weights": np.asarray(interaction.weights),
+                "n_spin": 0,
+                "n_categorical": 0,
+                "contribution_kind": "linear",
+            }
+        if hasattr(interaction, "inverse_weights"):
+            return {
+                "weights": np.reciprocal(np.asarray(interaction.inverse_weights)),
+                "n_spin": 0,
+                "n_categorical": 0,
+                "contribution_kind": "precision",
+            }
+    raise TypeError(f"Cannot lower interaction of type {type(interaction)}")
+
+
+def _build_block_global_starts(gibbs_spec) -> tuple[tuple[int, ...], int]:
+    starts = []
+    offset = 0
+    for block in gibbs_spec.blocks:
+        starts.append(offset)
+        offset += len(block.nodes)
+    return tuple(starts), offset
+
+
+def _build_global_state_layout(gibbs_spec) -> _GlobalStateLayout:
+    block_starts, total_nodes = _build_block_global_starts(gibbs_spec)
+    max_global_ind = max(
+        (location[0] for location in gibbs_spec.node_global_location_map.values()),
+        default=-1,
+    )
+    global_to_flat: list[list[int | None]] = [[] for _ in range(max_global_ind + 1)]
+
+    for block_index, block in enumerate(gibbs_spec.blocks):
+        block_start = block_starts[block_index]
+        for node_offset, node in enumerate(block.nodes):
+            global_ind, global_offset = gibbs_spec.node_global_location_map[node]
+            mapping = global_to_flat[global_ind]
+            if len(mapping) <= global_offset:
+                mapping.extend([None] * (global_offset + 1 - len(mapping)))
+            mapping[global_offset] = block_start + node_offset
+
+    compact_maps = []
+    for mapping in global_to_flat:
+        if any(value is None for value in mapping):
+            raise ValueError("THRML global state map is not dense.")
+        compact_maps.append(tuple(value for value in mapping if value is not None))
+
+    return _GlobalStateLayout(
+        block_starts=block_starts,
+        global_to_flat=tuple(compact_maps),
+        total_nodes=total_nodes,
+    )
+
+
+def _build_interaction_spec(
+    interaction,
+    active_mask,
+    global_inds,
+    global_slices,
+    family: Family,
+    n_nodes: int,
+    layout: _GlobalStateLayout,
+) -> FusedInteractionSpec:
+    lowered = _lower_interaction(interaction, family)
+    weights = np.asarray(lowered["weights"], dtype=np.float32)
+    mask = np.asarray(active_mask, dtype=np.float32)
+    if weights.ndim == 1:
+        weights = weights.reshape(n_nodes, -1)
+    if mask.ndim == 1:
+        mask = mask.reshape(n_nodes, -1)
+
+    if weights.shape[:2] == mask.shape:
+        n_terms = int(mask.shape[1])
+        mask_expanded = mask.reshape(mask.shape + (1,) * (weights.ndim - 2))
+        weighted_mask = (weights * mask_expanded).astype(np.float32)
+    elif weights.shape == mask.shape:
+        weighted_mask = (weights * mask).astype(np.float32)
+        n_terms = int(weighted_mask.shape[-1])
+    else:
+        raise ValueError(f"weights shape {weights.shape} does not match mask shape {mask.shape}")
+
+    n_spin = int(lowered["n_spin"])
+    explicit_n_categorical = lowered.get("n_categorical")
+    if explicit_n_categorical is not None:
+        n_categorical_sources = int(explicit_n_categorical)
+    elif family == Family.CATEGORICAL:
+        n_categorical_sources = max(0, weights.ndim - 3)
+    elif lowered["contribution_kind"] == "default":
+        n_categorical_sources = max(0, weights.ndim - 2)
+    else:
+        n_categorical_sources = 0
+
+    gather_arrays: list[np.ndarray] = []
+    flat_slices = layout.flatten_slices(global_inds, global_slices)
+    for gslice in flat_slices:
+        arr = np.asarray(gslice, dtype=np.int32)
+        if arr.shape != (n_nodes, n_terms):
+            raise ValueError(f"gather slice shape {arr.shape} does not match ({n_nodes}, {n_terms})")
+        gather_arrays.append(arr)
+
+    min_sources = n_spin + n_categorical_sources
+    if len(gather_arrays) < min_sources:
+        raise ValueError(
+            f"too few gather slices: need at least {min_sources} "
+            f"(n_spin={n_spin} + n_categorical_sources={n_categorical_sources}), "
+            f"got {len(gather_arrays)}"
+        )
+
+    return FusedInteractionSpec(
+        weighted_mask=weighted_mask,
+        gather_indices=tuple(gather_arrays),
+        n_spin=n_spin,
+        n_categorical=n_categorical_sources,
+        n_terms=n_terms,
+        contribution_kind=lowered["contribution_kind"],
+    )
+
+
+def _build_fused_block_spec(
+    program: BlockSamplingProgram,
+    block_index: int,
+    block,
+    family: Family,
+    block_global_start: int,
+    total_nodes: int,
+    layout: _GlobalStateLayout,
+) -> FusedBlockSpec:
+    n_nodes = len(block.nodes)
+    n_categories = _get_n_categories(block, family)
+
+    interactions = []
+    for interaction, active_mask, global_inds, global_slices in zip(
+        program.per_block_interactions[block_index],
+        program.per_block_interaction_active[block_index],
+        program.per_block_interaction_global_inds[block_index],
+        program.per_block_interaction_global_slices[block_index],
+        strict=True,
+    ):
+        interactions.append(
+            _build_interaction_spec(
+                interaction,
+                active_mask,
+                global_inds,
+                global_slices,
+                family,
+                n_nodes,
+                layout,
+            )
+        )
+
+    if family == Family.CATEGORICAL and interactions:
+        for ispec in interactions:
+            wm = np.asarray(ispec.weighted_mask)
+            if wm.ndim >= 3:
+                n_categories = int(wm.shape[2])
+                break
+            if ispec.n_terms > 0:
+                n_categories = int(wm.shape[-1] // ispec.n_terms)
+
+    return FusedBlockSpec(
+        block_index=block_index,
+        family=family,
+        n_nodes=n_nodes,
+        n_categories=n_categories,
+        block_global_start=block_global_start,
+        total_nodes=total_nodes,
+        interactions=tuple(interactions),
+    )
+
+
 def build_ttlang_compiled_blocks(program: BlockSamplingProgram) -> tuple[CompiledFusedBlock, ...]:
-    """Build THRML block specs for TT-Lang planning without compiling TT-MLIR."""
-    from .compiler import _build_fused_block_spec, _build_global_state_layout, _infer_family
+    """Build THRML block specs for TT-Lang planning."""
 
     scalar_layout = _build_global_state_layout(program.gibbs_spec)
     specs = []
@@ -390,12 +611,7 @@ def expand_categorical_gather_lanes(
     scalar_gather_indices: np.ndarray,
     n_categories: int,
 ) -> np.ndarray:
-    """Expand scalar categorical gather indices to one-hot category lane indices.
-
-    The current TT-MLIR lowering gathers a scalar category id and then uses it
-    to select a weight slice. TT-Lang kernels should instead gather all category
-    lanes and compute `one_hot * weights` directly.
-    """
+    """Expand scalar categorical gather indices to one-hot category lane indices."""
     gather = np.asarray(scalar_gather_indices, dtype=np.int32)
     expanded = categorical_source_lanes(layout, gather.reshape(-1), n_categories)
     return expanded.reshape(gather.shape + (n_categories,))
@@ -404,10 +620,9 @@ def expand_categorical_gather_lanes(
 def build_spin_categorical_plan(layout: TTLangStateLayout, spec: FusedBlockSpec) -> TTLangSpinCategoricalPlan:
     """Lower a simple spin block to a TT-Lang categorical-source plan.
 
-    This intentionally accepts only the first production shape proven by the
-    TT-Lang spikes: one spin node, scalar/bias terms, and categorical source
-    terms represented as category planes. Unsupported interaction structure
-    raises clearly so callers can fall back to the existing TT-MLIR backend.
+    This accepts the first production shape proven on hardware: one spin node,
+    scalar/bias terms, and categorical source terms represented as category
+    planes. Unsupported interaction structure raises clearly.
     """
     if spec.family != Family.SPIN:
         raise ValueError(f"expected spin block, got {spec.family.value}")

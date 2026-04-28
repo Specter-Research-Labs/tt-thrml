@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any
 from thrml.block_sampling import BlockSamplingProgram
 
 if TYPE_CHECKING:
-    from .ttlang_backend import ExperimentalTTLangExecutor
+    from .ttlang_backend import TTLangProgramPlanner
 
 TILE = 32
 N_CATEGORIES = 3
@@ -27,7 +27,7 @@ def state_tiles(lanes: Any) -> Any:
     return tile_planes([float(value) for value in lanes])
 
 
-def validate_ttlang_discrete_runtime(executor: "ExperimentalTTLangExecutor") -> None:
+def validate_ttlang_discrete_runtime(executor: "TTLangProgramPlanner") -> None:
     """Validate the narrow program shape currently backed by hardware kernels."""
     if executor.layout.total_lanes != 10:
         raise ValueError(f"TT-Lang discrete runtime expects 10 lanes, got {executor.layout.total_lanes}")
@@ -56,17 +56,17 @@ def validate_ttlang_discrete_runtime(executor: "ExperimentalTTLangExecutor") -> 
 
 
 def supports_ttlang_discrete_runtime(program: BlockSamplingProgram) -> bool:
-    from .ttlang_backend import ExperimentalTTLangExecutor
+    from .ttlang_backend import TTLangProgramPlanner
 
     try:
-        validate_ttlang_discrete_runtime(ExperimentalTTLangExecutor(program))
+        validate_ttlang_discrete_runtime(TTLangProgramPlanner(program))
     except ValueError:
         return False
     return True
 
 
 def make_ttlang_discrete_runtime(
-    *, ttl: Any, ttnn: Any, device: Any, executor: "ExperimentalTTLangExecutor"
+    *, ttl: Any, ttnn: Any, device: Any, executor: "TTLangProgramPlanner"
 ) -> "TTLangDiscreteSweepRuntime":
     validate_ttlang_discrete_runtime(executor)
     return TTLangDiscreteSweepRuntime(ttl=ttl, ttnn=ttnn, device=device, executor=executor)
@@ -80,9 +80,9 @@ def make_primary_ttlang_executor(
     ttl_module: Any | None = None,
 ) -> "TTLangDiscreteSweepRuntime":
     """Build the primary TT-Lang executor for the currently proven program shape."""
-    from .ttlang_backend import ExperimentalTTLangExecutor
+    from .ttlang_backend import TTLangProgramPlanner
 
-    executor = ExperimentalTTLangExecutor(program)
+    executor = TTLangProgramPlanner(program)
     validate_ttlang_discrete_runtime(executor)
     if ttl_module is None:
         try:
@@ -103,7 +103,7 @@ class TTLangDiscreteSweepRuntime:
 
     dispatches_per_sweep = 6
 
-    def __init__(self, *, ttl: Any, ttnn: Any, device: Any, executor: "ExperimentalTTLangExecutor"):
+    def __init__(self, *, ttl: Any, ttnn: Any, device: Any, executor: "TTLangProgramPlanner"):
         validate_ttlang_discrete_runtime(executor)
         self.ttl = ttl
         self.ttnn = ttnn
@@ -300,7 +300,7 @@ def _categorical_key(block_index: int, name: str) -> str:
 
 
 def _make_runtime_groups(
-    executor: "ExperimentalTTLangExecutor", spin_plans: dict[int, Any], categorical_plans: dict[int, Any]
+    executor: "TTLangProgramPlanner", spin_plans: dict[int, Any], categorical_plans: dict[int, Any]
 ) -> tuple[_RuntimeGroup, ...]:
     groups = []
     for block_indices in executor.sampling_order:

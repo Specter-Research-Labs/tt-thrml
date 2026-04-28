@@ -6,7 +6,7 @@ import pytest
 from tt_thrml.core import Family
 from tt_thrml.example_programs import make_mixed_spin_categorical_gaussian_program
 from tt_thrml.ttlang_backend import (
-    ExperimentalTTLangExecutor,
+    TTLangProgramPlanner,
     build_categorical_spin_plan,
     build_spin_categorical_plan,
     build_ttlang_compiled_blocks,
@@ -126,8 +126,8 @@ def test_ttlang_builds_spin_categorical_plan_from_mixed_program_spec():
     assert evaluate_spin_categorical_plan(plan, cat_one, threshold_logit=0.0) == -1.0
 
 
-def test_experimental_ttlang_executor_materializes_supported_spin_plan():
-    executor = ExperimentalTTLangExecutor(make_mixed_spin_categorical_gaussian_program())
+def test_ttlang_program_planner_materializes_supported_spin_plan():
+    executor = TTLangProgramPlanner(make_mixed_spin_categorical_gaussian_program())
 
     assert len(executor.spin_categorical_plans) == 2
 
@@ -177,8 +177,8 @@ def test_ttlang_builds_categorical_spin_plan_from_mixed_program_spec():
     assert evaluate_categorical_spin_plan(plan, state_lanes, gumbel=(-2.0, 2.0, 0.0)) == 1
 
 
-def test_experimental_ttlang_executor_materializes_supported_categorical_plan():
-    executor = ExperimentalTTLangExecutor(make_mixed_spin_categorical_gaussian_program())
+def test_ttlang_program_planner_materializes_supported_categorical_plan():
+    executor = TTLangProgramPlanner(make_mixed_spin_categorical_gaussian_program())
 
     assert len(executor.categorical_spin_plans) == 2
 
@@ -201,8 +201,8 @@ def test_experimental_ttlang_executor_materializes_supported_categorical_plan():
     assert run.expected_one_hot == (1.0, 0.0, 0.0)
 
 
-def test_experimental_ttlang_executor_evaluates_supported_discrete_sweep_by_group():
-    executor = ExperimentalTTLangExecutor(make_mixed_spin_categorical_gaussian_program())
+def test_ttlang_program_planner_evaluates_supported_discrete_sweep_by_group():
+    executor = TTLangProgramPlanner(make_mixed_spin_categorical_gaussian_program())
     state_lanes = executor.encode_state(
         [
             np.asarray([True]),
@@ -233,8 +233,8 @@ def test_experimental_ttlang_executor_evaluates_supported_discrete_sweep_by_grou
     np.testing.assert_allclose(decoded[5], [-0.75])
 
 
-def test_experimental_ttlang_executor_evaluates_repeated_supported_discrete_sweeps():
-    executor = ExperimentalTTLangExecutor(make_mixed_spin_categorical_gaussian_program())
+def test_ttlang_program_planner_evaluates_repeated_supported_discrete_sweeps():
+    executor = TTLangProgramPlanner(make_mixed_spin_categorical_gaussian_program())
     state_lanes = executor.encode_state(
         [
             np.asarray([True]),
@@ -266,7 +266,7 @@ def test_experimental_ttlang_executor_evaluates_repeated_supported_discrete_swee
 
 def test_ttlang_runtime_support_boundary_accepts_only_proven_discrete_shape():
     program = make_mixed_spin_categorical_gaussian_program()
-    executor = ExperimentalTTLangExecutor(program)
+    executor = TTLangProgramPlanner(program)
 
     assert supports_ttlang_discrete_runtime(program)
     validate_ttlang_discrete_runtime(executor)

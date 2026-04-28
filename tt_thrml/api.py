@@ -16,11 +16,11 @@ def make_executor(
 ) -> Any:
     """Build the primary TT-Lang executor for supported THRML program shapes."""
     if config is not None:
-        raise ValueError("the primary TT-Lang executor does not use TT-MLIR config")
+        raise ValueError("the primary TT-Lang executor does not accept a backend config")
     if n_sweeps != 100:
         raise ValueError("the primary TT-Lang executor does not use n_sweeps; configure sweeps when running")
     if profile:
-        raise ValueError("the primary TT-Lang executor does not use TT-MLIR profiling")
+        raise ValueError("the primary TT-Lang executor does not expose profiling flags")
 
     from .ttlang_runtime import make_primary_ttlang_executor
 

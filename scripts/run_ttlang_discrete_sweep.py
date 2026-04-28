@@ -12,7 +12,7 @@ sys.path.insert(0, str(REPO_ROOT))
 
 import tt_thrml
 from tt_thrml.example_programs import make_mixed_spin_categorical_gaussian_program
-from tt_thrml.ttlang_backend import ExperimentalTTLangExecutor, decode_state
+from tt_thrml.ttlang_backend import TTLangProgramPlanner, decode_state
 from tt_thrml.ttlang_runtime import state_tiles
 
 
@@ -66,7 +66,7 @@ def main() -> None:
 
     ttnn = _require_ttnn()
     program = make_mixed_spin_categorical_gaussian_program()
-    executor = ExperimentalTTLangExecutor(program)
+    executor = TTLangProgramPlanner(program)
     initial_state = _initial_state()
     initial_lanes = executor.encode_state(initial_state)
     sweep_kwargs = {

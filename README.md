@@ -1,11 +1,11 @@
 # tt-thrml
 
-`tt-thrml` is the Tenstorrent execution backend for upstream [`thrml`](https://github.com/extropic-ai/thrml).
+`tt-thrml` is the Tenstorrent TT-Lang execution layer for upstream
+[`thrml`](https://github.com/extropic-ai/thrml).
 
-Upstream `thrml` owns model authoring, blocks, samplers, and schedules. `tt-thrml` owns:
-- TT-Lang-first execution for supported THRML program shapes
-- device-resident backend state across sweeps
-- explicit TT-MLIR execution for comparisons while the TT-Lang path broadens
+Upstream `thrml` owns model authoring, blocks, samplers, and schedules.
+`tt-thrml` owns the device-resident TT-Lang execution path for supported THRML
+program shapes.
 
 ## Public Surface
 
@@ -19,118 +19,28 @@ The intended API is intentionally small:
 - `tt_thrml.close_devices`
 - `tt_thrml.make_executor`
 
-Everything else should be treated as compiler/runtime internals.
+Everything else is compiler/runtime internals.
 
 ## Execution Model
 
-`make_executor` is TT-Lang-first. It builds the hardware-proven TT-Lang
-executor for the supported mixed discrete program shape and fails clearly for
-unsupported shapes instead of switching execution paths implicitly.
+`make_executor` builds the primary TT-Lang executor. Unsupported program shapes
+fail clearly instead of switching to another backend.
 
-The older TT-MLIR/TTRT path remains available for parity and performance
-comparisons through explicit imports from `tt_thrml.core` and
-`tt_thrml.executor`. That path compiles each THRML program once to a set of
-fused TT-MLIR flatbuffer kernels, one per THRML sampling group. A single sweep
-invokes each group kernel as:
-
-```
-(global_state, *rng_slices) -> new_global_state
-```
-
-All interaction math, Gibbs sampling, and state update happen inside the flatbuffer. Blocks in the same THRML superblock read the same pre-group state and commit together. The host never reads state back mid-sweep.
-
-The supported parameter families are spin, categorical, and gaussian. Mixed programs built from those families are supported.
-
-## TT-Lang Direction
-
-The TT-Lang backend work uses a different internal state contract from the
-current TT-MLIR path. Host-facing THRML state stays the same, but
-device-resident state is lowered into family-specific lanes:
-
-- spin: one signed lane per node
-- categorical: one one-hot lane per category per node
-- gaussian: one value lane per node
-
-This keeps categorical source selection as direct tiled arithmetic
-(`one_hot * weights`) instead of scalar category-id gather logic. The initial
-layout and conversion primitives live in `tt_thrml.ttlang_backend`.
-
-The first hardware runners are:
-
-```bash
-python scripts/run_ttlang_spin_categorical_plan.py
-python scripts/run_ttlang_categorical_spin_plan.py
-python scripts/run_ttlang_discrete_sweep.py
-python scripts/run_ttlang_discrete_sweep.py --benchmark 50
-```
-
-They lower the shared mixed spin/categorical/gaussian smoke program into the
-first TT-Lang plan shapes:
+The current hardware-proven path supports the mixed discrete smoke shape:
 
 - spin target from one-hot categorical source lanes
 - categorical target from signed spin source lanes
-- a two-group discrete sweep that keeps the 10-lane backend state resident on
-  device between group updates
+- two Gibbs sampling groups
+- device-resident 10-lane TT-Lang state across sweeps
+- six TT-Lang dispatches per sweep
 
-The validated dispatch jobs were:
+Host-facing THRML state remains booleans, category ids, and floats. Device state
+is lowered into TT-Lang lanes:
 
-```text
-j-quietbox-ttlang-spin-categorical-plan-hw-shared-program-hj4zsy
-j-quietbox-ttlang-categorical-spin-plan-hw-scorebuf-hj4hzj
-j-quietbox-ttlang-discrete-sweep-hw-copy3-hjmuox
-j-quietbox-ttlang-discrete-sweep-bench-50-hjvh1e
-j-quietbox-ttlang-discrete-sweep-bench-50-after-reboot-hkw0q6
-j-quietbox-ttmlir-demo-profile-after-reboot-hkwz4n
-j-quietbox-ttlang-discrete-runtime-hw-globalttl-idpbb3
-j-quietbox-ttlang-discrete-runtime-bench-50-idogfw
-j-quietbox-ttlang-discrete-runtime-current-state-bench-idy121
-j-quietbox-ttlang-discrete-runtime-final-state-bench-ie1v9y
-j-quietbox-ttlang-discrete-runtime-support-boundary-bench-iere11
-j-quietbox-ttlang-discrete-runtime-randomness-bench-ieu9sz
-j-quietbox-ttlang-discrete-runtime-plan-derived-kernels-b-if69dh
-j-quietbox-ttlang-primary-make-executor-bench-ifdt3v
-j-quietbox-ttlang-primary-executor-state-api-bench-ifoy44
-j-quietbox-ttlang-runtime-no-numpy-bench-ii3rtc
-j-quietbox-ttlang-public-api-cleanup-container-bench-iidn8l
-j-quietbox-ttlang-primary-api-split-bench-iis5o3
-j-quietbox-ttlang-plan-derived-runtime-groups-bench-ij06pv
-```
-
-The latest final-state-checked nonzero-randomness 50-sweep TT-Lang benchmark
-measured 33.22 ms total, or 0.664 ms/sweep, for the current narrow
-implementation. It still uses six dispatches per sweep, so this is a baseline
-before fusing group copy/update work.
-
-The current TT-MLIR/TTRT demo profile is not the same narrow workload, but it
-shows the overhead we are trying to escape: the mixed demo reported mean
-dispatch costs of 0.665 ms for spin, 1.251 ms for categorical, and 0.684 ms for
-gaussian block calls. That makes the TT-Lang discrete runner directionally
-promising even before dispatch fusion.
-
-One detail matters for the final executor: `ttl.math.sign(0)` returns `0`,
-while THRML's spin update uses a strict `>` decision whose tie result is the
-negative spin. The runner encodes the strict decision as
-`sign(sign(x) - 0.5)`, avoiding `where` while preserving THRML tie behavior.
-
-Before deleting the TT-MLIR comparison path, compare it against the TT-Lang
-executor on the same Wormhole for spin-only, categorical-only, and mixed
-workloads, measuring compile time, first-sweep latency, steady-state
-milliseconds per sweep, dispatch count, transfer count, and parity against the
-CPU sampler.
-
-## Install
-
-```bash
-pip install -e ".[runtime]"
-```
-
-Available extras:
-- `runtime`: installs JAX and Torch
-- `jax`: installs JAX only
-- `torch`: installs Torch only
-- `testing`: installs the local pytest/coverage stack
-
-TTNN, TTRT, and TT-MLIR remain environment-provided dependencies. Use a Tenstorrent container or a local Tenstorrent toolchain build for those.
+- spin: one signed lane per node
+- categorical: one one-hot lane per category per node
+- gaussian: one value lane per node, preserved until the TT-Lang gaussian update
+  kernel lands
 
 ## Quick Start
 
@@ -157,39 +67,63 @@ finally:
     tt_thrml.close_device(ttnn, device)
 ```
 
-## Wormhole Parity Tests
-
-The hardware parity suite lives in [`tests/parity/test_wormhole_parity.py`](tests/parity/test_wormhole_parity.py). It requires:
+## Runners
 
 ```bash
-export TTMLIR_BUILD_DIR=/path/to/tt-mlir/build
-export SYSTEM_DESC_PATH=/path/to/system_desc.ttsys
+python scripts/run_ttlang_spin_categorical_plan.py
+python scripts/run_ttlang_categorical_spin_plan.py
+python scripts/run_ttlang_discrete_sweep.py
+python scripts/run_ttlang_discrete_sweep.py --benchmark 50
 ```
 
-Then run with:
+For QuietBox validation, run inside the `tt-lang-codex` TT-Lang container or
+through `dispatch` with a Wormhole device allocation. The container must expose
+the TT device, hugepages, 1G hugepage sysfs, and host networking for dependency
+installation:
 
 ```bash
-./scripts/run_wormhole_smoke_perf_in_tt_docker.sh -k wormhole_parity -q
+podman run -d --privileged --network host --name tt-lang-codex \
+  --device=/dev/tenstorrent/0:/dev/tenstorrent/0 \
+  -v /dev/hugepages:/dev/hugepages \
+  -v /dev/hugepages-1G:/dev/hugepages-1G \
+  ghcr.io/tenstorrent/tt-lang/tt-lang-dist-ubuntu-22-04:latest sleep infinity
 ```
 
-The helper mounts the repo, TT-MLIR build, devices, and hugepages into a TT container, installs the `ttrt` wheel, and runs the suite.
+## Latest Hardware Check
+
+Current cleanup HEAD passed on QuietBox:
+
+```text
+j-quietbox-ttlang-ttfirst-cleanup-bench-iko2j5
+PASS: TT-Lang THRML discrete sweep
+50 sweeps, 32.40 ms total, 0.648 ms/sweep, 6 dispatches/sweep
+```
+
+Earlier warm-container runs of the same TT-Lang path measured about
+0.64-0.66 ms/sweep.
+
+## Install
+
+```bash
+pip install -e ".[runtime]"
+```
+
+Available extras:
+
+- `runtime`: installs JAX and Torch
+- `jax`: installs JAX only
+- `torch`: installs Torch only
+- `testing`: installs the local pytest/coverage stack
+- `development`: installs formatters and type checking tools
+
+TTNN and TT-Lang remain environment-provided dependencies.
 
 ## Device Ownership
 
 - Caller-owned TTNN devices remain caller-owned.
 - Executors borrow devices; they do not close them.
-- The TT-MLIR bridge wraps a live TTNN device but does not take ownership.
-
-## RNG Contract
-
-Sampling randomness is pre-generated for the full run interval, uploaded once, and consumed by sweep offset. The executor uses a stable `(sweep, block)` index derived from the root JAX key matching upstream THRML's key derivation, so seeded runs are reproducible.
-
-## Multi-Device
-
-`tt-thrml` supports:
-- many-job execution across multiple devices
-- single-process `MeshDevice` execution with replicated state and sweep-group synchronization via `MeshExecutor`
 
 ## Internals
 
-See [`docs/tt-thrml-internals.md`](docs/tt-thrml-internals.md) for architecture notes.
+See [`docs/tt-thrml-internals.md`](docs/tt-thrml-internals.md) for architecture
+notes.

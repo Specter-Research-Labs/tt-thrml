@@ -1,122 +1,74 @@
-# TT-THRML Internals
+# tt-thrml Internals
 
-`tt-thrml` has one simple boundary:
+`tt-thrml` lowers supported THRML programs directly into TT-Lang-oriented
+state and runtime kernels.
 
-- upstream `thrml` owns program authoring
-- `tt-thrml` owns Tenstorrent execution
+## State Layout
 
-The executor compiles each THRML sampling group once to a fused TT-MLIR flatbuffer kernel, keeps all block states concatenated in a single on-device tensor, and runs sweeps by invoking each group kernel with pre-uploaded RNG slices.
+THRML host state keeps the original shapes:
 
-## Architecture
+- spin blocks: booleans
+- categorical blocks: scalar category ids
+- gaussian blocks: floats
 
-```mermaid
-flowchart TD
-    A["THRML BlockSamplingProgram"] --> B["compile_program()"]
-    B --> C["CompiledProgram\n(block specs + group kernels)"]
-    C --> D["Executor / MeshExecutor"]
-    D --> E["global_state\n(all blocks, flat float32 tensor)"]
-    D --> F["BulkRNGBuffers\n(per-block per-sweep, pre-uploaded)"]
-    E --> G["run_sweep()"]
-    F --> G
-    G --> H["for each sampling group:\n_run_sampling_group(group, sweep_idx)"]
-    H --> I["(global_state, *rng_slices) → new_global_state\nvia TTRT flatbuffer"]
+The runtime state is a single TT-Lang lane tensor:
+
+- spin blocks become signed `-1/+1` lanes
+- categorical blocks become one-hot category lanes
+- gaussian blocks become value lanes
+
+The current mixed smoke program has six THRML blocks and ten TT-Lang lanes:
+
+```text
+block 0 spin        lane 0
+block 1 categorical lanes 1..3
+block 2 gaussian    lane 4
+block 3 spin        lane 5
+block 4 categorical lanes 6..8
+block 5 gaussian    lane 9
 ```
 
-## Compilation
+## Planning
 
-Each THRML block is lowered to a `FusedBlockSpec`; each sampling group is compiled to a single flatbuffer that fuses every block in the group.
+`TTLangProgramPlanner` reads the THRML `BlockSamplingProgram`, infers each block
+family, folds active masks into interaction weights, translates THRML gather
+slices into flat scalar indices, and then expands categorical scalar gathers
+into one-hot lane gathers.
 
-```mermaid
-flowchart TD
-    A["Block + interactions"] --> B["FusedBlockSpec\n(weighted_mask, gather_indices\nper interaction)"]
-    B --> C["JAX group function:\ngather sources → compute all block updates → commit together"]
-    C --> D["jax.export → StableHLO"]
-    D --> E["ttmlir-opt:\nStableHLO → TTIR → TTNN"]
-    E --> F["ttmlir-translate:\nTTNN → flatbuffer .ttnn"]
-    F --> G["CompiledSamplingGroup\n(artifact path cached by SHA256 signature)"]
-```
+The current hardware-proven planner accepts:
 
-## Sweep Flow
+- one-node spin targets with categorical sources
+- one-node categorical targets with spin sources
+- two Gibbs groups, each containing one spin update and one categorical update
 
-```mermaid
-flowchart TD
-    A["run_sweep(sweep_idx)"] --> B["for each sampling group in order"]
-    B --> C["slice_rng_for_sweep for every block in group"]
-    C --> D["_run_compiled_kernel(\n  artifact_path,\n  [global_state, *rng_slices]\n)"]
-    D --> E["new_global_state\n(all group updates committed)"]
-    E --> F["update global_state pointer"]
-    F --> G{"more blocks?"}
-    G -->|yes| B
-    G -->|no| H["sweep done\n(no host readback)"]
-```
+Unsupported shapes raise during planning or runtime validation.
 
-## Kernel Structure (per family)
+## Runtime
 
-Each fused group kernel takes `(global_state, *rng_slices)` and returns `new_global_state`. All interaction math, sampling, and state update happen inside the flatbuffer.
+`TTLangDiscreteSweepRuntime` owns device-resident state buffers and TT-Lang
+operations. One sweep currently runs:
 
-**Spin:**
-```
-gather source states from global_state
-compute gamma = sum(weights * source_states)
-new_state = where(2*gamma > rng_logistic, +1, -1)
-scatter new_state into global_state slice
-```
+1. copy pre-group state to the group output buffer
+2. update the group's spin block
+3. update the group's categorical block
+4. repeat for the second group
 
-**Categorical:**
-```
-gather source states from global_state
-compute log_theta[k] = sum(weights[k] * source_states)
-new_state = argmax(log_theta + rng_gumbel)
-scatter new_state into global_state slice
-```
+That is six TT-Lang dispatches per sweep. The next major optimization target is
+to reduce dispatch count by fusing per-group copy and update work without
+breaking TT-Lang dataflow balance.
 
-**Gaussian:**
-```
-gather source states from global_state
-compute linear = sum(weights * source_states)
-compute precision = sum(reciprocal(inverse_weights) * source_states)
-variance = 1 / precision
-mean = linear * variance
-new_state = mean + sqrt(variance) * rng_normal
-scatter new_state into global_state slice
-```
+## Randomness
 
-## RNG Contract
+The current runner exposes deterministic per-block inputs:
 
-Bulk RNG is pre-generated on the host and uploaded once per `sample_with_observation` call. Each sweep consumes one slice per block by index — no per-sweep uploads in the hot path.
+- spin threshold logits
+- categorical Gumbel values
 
-Key derivation mirrors THRML's `sample_with_observation` exactly:
-
-```
-(sample_key, warmup_key) = split(root_key)
-
-warmup sweeps:  split(warmup_key, n_warmup)[sweep_i]
-sample sweeps:  split(split(sample_key, n_samples-1)[outer], steps_per_sample)[inner]
-
-per_block_keys = split(sweep_key, n_free_blocks)
-block_rng_key  = split(per_block_keys[block_index])[0]
-```
-
-This gives sample-by-sample parity with upstream THRML on the JAX reference path.
-
-## Global State Layout
-
-All blocks are concatenated into one flat `float32` tensor:
-
-```
-[block_0_nodes | block_1_nodes | ... | block_n_nodes]
-   n_nodes[0]     n_nodes[1]           n_nodes[n]
-```
-
-- Free blocks come first, clamped blocks after.
-- Spin states are stored as `±1.0`.
-- Categorical states are stored as the integer category index cast to `float32`.
-- Gaussian states are stored directly as `float32`.
-- THRML `(global_state_index, relative_index)` source slices are lowered once into this flat block-ordered layout before compilation.
+Those constants are uploaded to device tensors before sweeps. General THRML RNG
+generation should land as TT-Lang-first runtime work, not by reintroducing a
+second backend path.
 
 ## Device Ownership
 
-- TTNN devices passed in by the caller stay caller-owned.
-- `MeshDevice`s passed in by the caller stay caller-owned.
-- Executors borrow those devices; they do not close them.
-- TT-MLIR runtime sessions opened internally are owned and closed by `tt-thrml`.
+The caller opens TTNN devices and passes them to `tt_thrml.make_executor`.
+Executors borrow devices and never close them.

@@ -1,11 +1,7 @@
-"""Core data structures, configuration, and device helpers."""
+"""Core data structures and device helpers."""
 
 from __future__ import annotations
 
-import hashlib
-import json
-import os
-import tempfile
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -16,28 +12,6 @@ class Family(str, Enum):
     SPIN = "spin"
     CATEGORICAL = "categorical"
     GAUSSIAN = "gaussian"
-
-
-@dataclass(frozen=True)
-class TTMLIRConfig:
-    system_desc_path: Path
-    artifact_root: Path
-    ttmlir_opt: str | Path
-    ttmlir_translate: str | Path
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "system_desc_path", Path(self.system_desc_path).resolve())
-        object.__setattr__(self, "artifact_root", Path(self.artifact_root).resolve())
-        object.__setattr__(self, "ttmlir_opt", _normalize_tool_path(self.ttmlir_opt))
-        object.__setattr__(self, "ttmlir_translate", _normalize_tool_path(self.ttmlir_translate))
-
-    def cache_key(self) -> str:
-        payload = {
-            "system_desc_path": str(self.system_desc_path),
-            "ttmlir_opt": str(self.ttmlir_opt),
-            "ttmlir_translate": str(self.ttmlir_translate),
-        }
-        return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:16]
 
 
 @dataclass(frozen=True)
@@ -76,103 +50,6 @@ class CompiledFusedBlock:
 
     spec: FusedBlockSpec
     kernel_artifact: Path | None
-
-
-@dataclass(frozen=True)
-class CompiledSamplingGroup:
-    """Compiled fused kernel for one THRML sampling group."""
-
-    block_indices: tuple[int, ...]
-    kernel_artifact: Path
-
-
-@dataclass(frozen=True)
-class CompiledProgram:
-    """Compiled THRML program with fused kernels."""
-
-    blocks: tuple[CompiledFusedBlock, ...]
-    sampling_groups: tuple[CompiledSamplingGroup, ...]
-    n_free_blocks: int
-    total_nodes: int
-    block_global_starts: tuple[int, ...]
-    sampling_order: tuple[tuple[int, ...], ...]
-    state_dtype: object
-    index_dtype: object
-    layout: object
-    rng_spec: RNGSpec
-
-
-@dataclass(frozen=True)
-class RNGSpec:
-    """Specification for bulk RNG buffers."""
-
-    n_sweeps: int
-    spin_blocks: tuple[int, ...]
-    categorical_blocks: tuple[int, ...]
-    gaussian_blocks: tuple[int, ...]
-    nodes_per_block: tuple[int, ...]
-    categories_per_block: tuple[int | None, ...]
-
-
-@dataclass(frozen=True)
-class BulkRNGBuffers:
-    """Pre-generated RNG buffers on device."""
-
-    spin_threshold_logits: dict[int, list[object]] | None
-    categorical_gumbel: dict[int, list[object]] | None
-    gaussian_noise: dict[int, list[object]] | None
-
-
-def _normalize_tool_path(command: str | Path) -> str:
-    command_str = str(command)
-    command_path = Path(command_str)
-    if command_path.is_absolute() or command_path.parent != Path("."):
-        return str(command_path.resolve())
-    return command_str
-
-
-def make_ttmlir_config(
-    *,
-    system_desc_path: Path | str,
-    artifact_root: Path | str | None = None,
-    build_dir: Path | str | None = None,
-    ttmlir_opt: Path | str | None = None,
-    ttmlir_translate: Path | str | None = None,
-) -> TTMLIRConfig:
-    """Create TT-MLIR configuration with sensible defaults."""
-    env_build_dir = os.environ.get("TTMLIR_BUILD_DIR")
-
-    if build_dir is not None and (ttmlir_opt is not None or ttmlir_translate is not None):
-        raise ValueError("Pass either build_dir or explicit tool paths, not both.")
-
-    if build_dir is None and ttmlir_opt is None and ttmlir_translate is None:
-        if env_build_dir is None:
-            raise ValueError(
-                "TT-MLIR tools must be configured. Pass build_dir, explicit tool paths, " "or set TTMLIR_BUILD_DIR."
-            )
-        build_dir = env_build_dir
-
-    if (ttmlir_opt is None) != (ttmlir_translate is None):
-        raise ValueError("Pass both ttmlir_opt and ttmlir_translate together.")
-
-    if build_dir is not None:
-        build_dir = Path(build_dir).resolve()
-        ttmlir_opt = build_dir / "bin" / "ttmlir-opt"
-        ttmlir_translate = build_dir / "bin" / "ttmlir-translate"
-
-    if ttmlir_opt is None or ttmlir_translate is None:
-        raise ValueError("TT-MLIR tool paths could not be resolved.")
-
-    resolved_artifact_root = Path(
-        artifact_root if artifact_root is not None else Path(tempfile.gettempdir()) / "tt-thrml"
-    ).resolve()
-
-    return TTMLIRConfig(
-        system_desc_path=Path(system_desc_path).resolve(),
-        artifact_root=resolved_artifact_root,
-        ttmlir_opt=ttmlir_opt,
-        ttmlir_translate=ttmlir_translate,
-    )
 
 
 def open_device(ttnn, *, device_id: int = 0) -> object:

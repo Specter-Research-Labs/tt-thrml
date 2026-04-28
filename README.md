@@ -3,27 +3,24 @@
 `tt-thrml` is the Tenstorrent execution backend for upstream [`thrml`](https://github.com/extropic-ai/thrml).
 
 Upstream `thrml` owns model authoring, blocks, samplers, and schedules. `tt-thrml` owns:
-- program compilation into fused per-sampling-group TT-MLIR kernels
-- bulk RNG generation (uploaded once, consumed by offset)
-- device-resident global state across sweeps
-- observation and sample materialization back to host
+- TT-Lang-first execution for supported THRML program shapes
+- device-resident backend state across sweeps
+- legacy TT-MLIR execution for comparisons while the TT-Lang path broadens
 
 ## Public Surface
 
 The intended API is intentionally small:
 
-- `tt_thrml.TTMLIRConfig`
-- `tt_thrml.make_ttmlir_config`
 - `tt_thrml.open_device`
 - `tt_thrml.open_devices`
 - `tt_thrml.open_mesh_device`
 - `tt_thrml.close_device`
 - `tt_thrml.close_mesh_device`
 - `tt_thrml.close_devices`
-- `tt_thrml.Executor`
 - `tt_thrml.make_executor`
-- `tt_thrml.MeshExecutor`
-- `tt_thrml.make_mesh_executor`
+- `tt_thrml.make_ttmlir_executor`
+- `tt_thrml.TTMLIRConfig`
+- `tt_thrml.make_ttmlir_config`
 - `tt_thrml.sample_states`
 - `tt_thrml.sample_with_observation`
 - `tt_thrml.GaussianConditional`
@@ -32,7 +29,14 @@ Everything else should be treated as compiler/runtime internals.
 
 ## Execution Model
 
-Each THRML program is compiled once to a set of fused TT-MLIR flatbuffer kernels, one per THRML sampling group. A single sweep invokes each group kernel as:
+`make_executor` is TT-Lang-first. It builds the hardware-proven TT-Lang
+executor for the supported mixed discrete program shape and fails clearly for
+unsupported shapes instead of silently falling back to the legacy backend.
+
+`make_ttmlir_executor` keeps the older TT-MLIR/TTRT path available for parity
+and performance comparisons. That path compiles each THRML program once to a
+set of fused TT-MLIR flatbuffer kernels, one per THRML sampling group. A single
+sweep invokes each group kernel as:
 
 ```
 (global_state, *rng_slices) -> new_global_state
@@ -89,10 +93,11 @@ j-quietbox-ttlang-discrete-runtime-final-state-bench-ie1v9y
 j-quietbox-ttlang-discrete-runtime-support-boundary-bench-iere11
 j-quietbox-ttlang-discrete-runtime-randomness-bench-ieu9sz
 j-quietbox-ttlang-discrete-runtime-plan-derived-kernels-b-if69dh
+j-quietbox-ttlang-primary-make-executor-bench-ifdt3v
 ```
 
 The latest final-state-checked nonzero-randomness 50-sweep TT-Lang benchmark
-measured 32.00 ms total, or 0.640 ms/sweep, for the current narrow
+measured 32.23 ms total, or 0.645 ms/sweep, for the current narrow
 implementation. It still uses six dispatches per sweep, so this is a baseline
 before fusing group copy/update work.
 

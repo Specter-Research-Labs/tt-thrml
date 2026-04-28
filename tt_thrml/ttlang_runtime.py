@@ -9,7 +9,7 @@ from typing import Any
 import numpy as np
 from thrml.block_sampling import BlockSamplingProgram
 
-from .ttlang_backend import ExperimentalTTLangExecutor
+from .ttlang_backend import ExperimentalTTLangExecutor, decode_state
 
 TILE = 32
 N_CATEGORIES = 3
@@ -73,6 +73,24 @@ def make_ttlang_discrete_runtime(
     return TTLangDiscreteSweepRuntime(ttl=ttl, ttnn=ttnn, device=device, executor=executor)
 
 
+def make_primary_ttlang_executor(
+    ttnn: Any,
+    device: Any,
+    program: BlockSamplingProgram,
+    *,
+    ttl_module: Any | None = None,
+) -> "TTLangDiscreteSweepRuntime":
+    """Build the primary TT-Lang executor for the currently proven program shape."""
+    executor = ExperimentalTTLangExecutor(program)
+    validate_ttlang_discrete_runtime(executor)
+    if ttl_module is None:
+        try:
+            import ttl as ttl_module  # type: ignore[reportMissingImports]
+        except ImportError as exc:
+            raise RuntimeError("ttl is required for the primary TT-Lang executor") from exc
+    return make_ttlang_discrete_runtime(ttl=ttl_module, ttnn=ttnn, device=device, executor=executor)
+
+
 class TTLangDiscreteSweepRuntime:
     """Device-resident executor for the current supported TT-Lang sweep shape.
 
@@ -108,6 +126,9 @@ class TTLangDiscreteSweepRuntime:
         self._state_next = self.from_torch(
             torch.zeros((self.executor.layout.total_lanes * TILE, TILE), dtype=torch.bfloat16)
         )
+
+    def load_state(self, state_free: Sequence[Any], state_clamp: Sequence[Any] = ()) -> None:
+        self.upload_state(self.executor.encode_state(list(state_free) + list(state_clamp)))
 
     def set_sweep_randomness(
         self,
@@ -158,6 +179,26 @@ class TTLangDiscreteSweepRuntime:
     def materialize_state(self) -> Any:
         current, _, _ = self._require_state()
         return self.ttnn.to_torch(current).to(_torch().bfloat16)
+
+    def read_state_lists(self) -> tuple[list[Any], list[Any]]:
+        lanes = self.materialize_state().cpu().numpy().reshape(self.executor.layout.total_lanes, TILE, TILE)[:, 0, 0]
+        decoded = decode_state(self.executor.layout, lanes.astype(np.float32))
+        n_free = len(self.executor.program.gibbs_spec.free_blocks)
+        return list(decoded[:n_free]), list(decoded[n_free:])
+
+    def sample_states(self, *args: Any, **kwargs: Any) -> Any:
+        raise NotImplementedError(
+            "TT-Lang is the primary executor path, but schedule-level sampling is not implemented yet. "
+            "Use load_state/run_sweep/run_sweeps for the supported discrete runtime, or make_ttmlir_executor "
+            "for legacy schedule-level comparisons."
+        )
+
+    def sample_with_observation(self, *args: Any, **kwargs: Any) -> Any:
+        raise NotImplementedError(
+            "TT-Lang is the primary executor path, but observer sampling is not implemented yet. "
+            "Use load_state/run_sweep/run_sweeps for the supported discrete runtime, or make_ttmlir_executor "
+            "for legacy observer comparisons."
+        )
 
     def from_torch(self, tensor: Any):
         return self.ttnn.from_torch(

@@ -12,16 +12,16 @@ import numpy as np
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
+import tt_thrml
 from tt_thrml.example_programs import make_mixed_spin_categorical_gaussian_program
 from tt_thrml.ttlang_backend import ExperimentalTTLangExecutor
-from tt_thrml.ttlang_runtime import make_ttlang_discrete_runtime, state_tiles
+from tt_thrml.ttlang_runtime import state_tiles
 
 
-def _require_ttlang():
-    import ttl  # type: ignore[reportMissingImports]
+def _require_ttnn():
     import ttnn  # type: ignore[reportMissingImports]
 
-    return ttl, ttnn
+    return ttnn
 
 
 def _initial_state() -> list[np.ndarray]:
@@ -53,8 +53,9 @@ def main() -> None:
     parser.add_argument("--benchmark", type=int, default=0, metavar="N", help="run N timed device-resident sweeps")
     args = parser.parse_args()
 
-    ttl, ttnn = _require_ttlang()
-    executor = ExperimentalTTLangExecutor(make_mixed_spin_categorical_gaussian_program())
+    ttnn = _require_ttnn()
+    program = make_mixed_spin_categorical_gaussian_program()
+    executor = ExperimentalTTLangExecutor(program)
     initial_lanes = executor.encode_state(_initial_state())
     sweep_kwargs = {
         "spin_threshold_logits": {0: -0.1, 3: 0.2},
@@ -67,12 +68,7 @@ def main() -> None:
 
     device = ttnn.open_device(device_id=0)
     try:
-        runtime = make_ttlang_discrete_runtime(
-            ttl=ttl,
-            ttnn=ttnn,
-            device=device,
-            executor=executor,
-        )
+        runtime = tt_thrml.make_executor(ttnn, device, program)
         runtime.upload_state(initial_lanes)
         runtime.set_sweep_randomness(**sweep_kwargs)
         runtime.run_sweep()

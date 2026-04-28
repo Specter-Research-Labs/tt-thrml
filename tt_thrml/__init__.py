@@ -23,11 +23,12 @@ from .core import (
     open_devices,
     open_mesh_device,
 )
-from .executor import Executor, make_executor
+from .executor import Executor, make_executor, make_ttmlir_executor
 from .mesh import MeshExecutor, make_mesh_executor, mesh_barrier, mesh_device_ids, mesh_size
 from .rng import generate_bulk_rng, make_rng_spec, slice_rng_for_sweep
 from .ttlang_runtime import (
     TTLangDiscreteSweepRuntime,
+    make_primary_ttlang_executor,
     make_ttlang_discrete_runtime,
     supports_ttlang_discrete_runtime,
     validate_ttlang_discrete_runtime,
@@ -46,8 +47,8 @@ def sample_states(
     device,
     config: TTMLIRConfig,
 ):
-    """High-level sampling API matching thrml.sample_states."""
-    executor = make_executor(ttnn, device, program, config)
+    """Legacy TT-MLIR sampling API matching thrml.sample_states."""
+    executor = make_ttmlir_executor(ttnn, device, program, config)
     return executor.sample_states(
         key,
         schedule,
@@ -70,8 +71,8 @@ def sample_with_observation(
     device,
     config: TTMLIRConfig,
 ):
-    """High-level observer sampling API matching thrml.sample_with_observation."""
-    executor = make_executor(ttnn, device, program, config)
+    """Legacy TT-MLIR observer sampling API matching thrml.sample_with_observation."""
+    executor = make_ttmlir_executor(ttnn, device, program, config)
     carry, results = executor.sample_with_observation(
         key,
         schedule,
@@ -94,12 +95,14 @@ __all__ = [
     "close_devices",
     "Executor",
     "make_executor",
+    "make_ttmlir_executor",
     "MeshExecutor",
     "make_mesh_executor",
     "sample_states",
     "sample_with_observation",
     "GaussianConditional",
     "TTLangDiscreteSweepRuntime",
+    "make_primary_ttlang_executor",
     "make_ttlang_discrete_runtime",
     "supports_ttlang_discrete_runtime",
     "validate_ttlang_discrete_runtime",

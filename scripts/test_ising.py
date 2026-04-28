@@ -82,7 +82,7 @@ def main():
 
         total_sweeps = schedule.n_warmup + schedule.n_samples * schedule.steps_per_sample
         print(f"\n--- Creating fused executor (n_sweeps={total_sweeps}) ---")
-        executor = tt_thrml.make_executor(ttnn, device, program, config, n_sweeps=total_sweeps)
+        executor = tt_thrml.make_ttmlir_executor(ttnn, device, program, config, n_sweeps=total_sweeps)
         print(f"Executor created with {len(executor.compiled.blocks)} fused blocks")
 
         for i, block in enumerate(executor.compiled.blocks):

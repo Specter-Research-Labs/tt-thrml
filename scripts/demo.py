@@ -286,7 +286,7 @@ def run_cpu(demo: Demo, key) -> tuple[list, float]:
 
 def run_wormhole(demo: Demo, key, *, ttnn, device, config, signpost, profile: bool = False) -> tuple[list, float]:
     signpost(header=f"compile:{demo.name}")
-    executor = tt_thrml.make_executor(ttnn, device, demo.program, config, profile=profile)
+    executor = tt_thrml.make_ttmlir_executor(ttnn, device, demo.program, config, profile=profile)
 
     signpost(header=f"run:{demo.name}")
     ttnn.start_tracy_zone(__file__, demo.name, 0)

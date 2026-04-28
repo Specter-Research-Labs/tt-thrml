@@ -442,7 +442,7 @@ def _spin_observer(state, _blocks):
 
 def run_spin_scenario(ttnn, device, config: TTMLIRConfig) -> dict:
     case = _make_spin_case()
-    executor = tt_thrml.make_executor(ttnn, device, case.program, config)
+    executor = tt_thrml.make_ttmlir_executor(ttnn, device, case.program, config)
     sample_keys = jax.random.split(jax.random.key(5101), 6)
     upstream_many, tt_many = _sample_states_many(case, sample_keys=sample_keys, executor=executor)
     upstream_samples = _stack_output(upstream_many, 0)
@@ -463,7 +463,7 @@ def run_spin_scenario(ttnn, device, config: TTMLIRConfig) -> dict:
 def run_categorical_scenario(ttnn, device, config: TTMLIRConfig) -> dict:
     n_categories = 3
     case = _make_categorical_case(n_categories=n_categories)
-    executor = tt_thrml.make_executor(ttnn, device, case.program, config)
+    executor = tt_thrml.make_ttmlir_executor(ttnn, device, case.program, config)
     sample_keys = jax.random.split(jax.random.key(5202), 12)
     upstream_many, tt_many = _sample_states_many(case, sample_keys=sample_keys, executor=executor)
     upstream_samples = _stack_output(upstream_many, 0)
@@ -495,7 +495,7 @@ def run_categorical_scenario(ttnn, device, config: TTMLIRConfig) -> dict:
 
 def run_gaussian_scenario(ttnn, device, config: TTMLIRConfig) -> dict:
     case = _make_gaussian_case()
-    executor = tt_thrml.make_executor(ttnn, device, case.program, config)
+    executor = tt_thrml.make_ttmlir_executor(ttnn, device, case.program, config)
     sample_keys = jax.random.split(jax.random.key(5303), 6)
     upstream_many, tt_many = _sample_states_many(case, sample_keys=sample_keys, executor=executor)
     upstream_samples = _stack_output(upstream_many, 0).astype(np.float64)
@@ -514,7 +514,7 @@ def run_gaussian_scenario(ttnn, device, config: TTMLIRConfig) -> dict:
 def run_mixed_scenario(ttnn, device, config: TTMLIRConfig) -> dict:
     n_categories = 3
     case = _make_mixed_case(n_categories=n_categories)
-    executor = tt_thrml.make_executor(ttnn, device, case.program, config)
+    executor = tt_thrml.make_ttmlir_executor(ttnn, device, case.program, config)
     sample_keys = jax.random.split(jax.random.key(5404), 6)
     upstream_many, tt_many = _sample_states_many(case, sample_keys=sample_keys, executor=executor)
     upstream_spin = _stack_output(upstream_many, 0)
@@ -576,7 +576,7 @@ def run_observation_clamp_scenario(ttnn, device, config: TTMLIRConfig) -> dict:
         _spin_observer,
     )
 
-    executor = tt_thrml.make_executor(ttnn, device, program, config)
+    executor = tt_thrml.make_ttmlir_executor(ttnn, device, program, config)
     sample_keys = jax.random.split(jax.random.key(5505), 4)
 
     upstream_carry: list[np.ndarray] | None = None

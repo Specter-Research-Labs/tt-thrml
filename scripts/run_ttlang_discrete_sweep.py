@@ -7,8 +7,6 @@ import argparse
 import sys
 from pathlib import Path
 
-import numpy as np
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
@@ -24,18 +22,18 @@ def _require_ttnn():
     return ttnn
 
 
-def _initial_state() -> list[np.ndarray]:
+def _initial_state() -> list[object]:
     return [
-        np.asarray([True]),
-        np.asarray([1], dtype=np.uint8),
-        np.asarray([0.25], dtype=np.float32),
-        np.asarray([False]),
-        np.asarray([1], dtype=np.uint8),
-        np.asarray([-0.75], dtype=np.float32),
+        [True],
+        [1],
+        [0.25],
+        [False],
+        [1],
+        [-0.75],
     ]
 
 
-def _assert_tiles_equal(result, expected_lanes: np.ndarray, *, label: str) -> None:
+def _assert_tiles_equal(result, expected_lanes: object, *, label: str) -> None:
     expected = state_tiles(expected_lanes)
     mismatches = result != expected
     if not mismatches.any():
@@ -48,11 +46,17 @@ def _assert_tiles_equal(result, expected_lanes: np.ndarray, *, label: str) -> No
     raise AssertionError(f"TT-Lang discrete sweep mismatch after {label}")
 
 
-def _assert_state_lists_equal(result: list[np.ndarray], expected: list[np.ndarray], *, label: str) -> None:
+def _as_plain_list(value: object) -> object:
+    tolist = getattr(value, "tolist", None)
+    return tolist() if callable(tolist) else value
+
+
+def _assert_state_lists_equal(result: list[object], expected: list[object], *, label: str) -> None:
     if len(result) != len(expected):
         raise AssertionError(f"TT-Lang decoded state length mismatch after {label}: {len(result)} != {len(expected)}")
     for index, (got, want) in enumerate(zip(result, expected, strict=True)):
-        np.testing.assert_array_equal(got, want, err_msg=f"{label} block {index}")
+        if _as_plain_list(got) != _as_plain_list(want):
+            raise AssertionError(f"TT-Lang decoded state mismatch after {label} block {index}: {got} != {want}")
 
 
 def main() -> None:

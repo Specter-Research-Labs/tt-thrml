@@ -6,7 +6,6 @@ import time
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-import numpy as np
 from thrml.block_sampling import BlockSamplingProgram
 
 from .ttlang_backend import ExperimentalTTLangExecutor, decode_state
@@ -24,11 +23,11 @@ _CATEGORICAL_GUMBEL_CONSTANTS = {1: "gumbel0", 4: "gumbel1"}
 
 def tile_planes(values: list[float]) -> Any:
     torch = _torch()
-    planes = np.asarray(values, dtype=np.float32)[:, None, None] * np.ones((len(values), TILE, TILE), dtype=np.float32)
-    return torch.from_numpy(planes.reshape(len(values) * TILE, TILE)).to(torch.bfloat16)
+    planes = torch.as_tensor(values, dtype=torch.float32).reshape(len(values), 1, 1).expand(len(values), TILE, TILE)
+    return planes.reshape(len(values) * TILE, TILE).to(torch.bfloat16)
 
 
-def state_tiles(lanes: np.ndarray) -> Any:
+def state_tiles(lanes: Any) -> Any:
     return tile_planes([float(value) for value in lanes])
 
 
@@ -117,7 +116,7 @@ class TTLangDiscreteSweepRuntime:
         self._state_mid: Any | None = None
         self._state_next: Any | None = None
 
-    def upload_state(self, lanes: np.ndarray) -> None:
+    def upload_state(self, lanes: Any) -> None:
         torch = _torch()
         self._state_current = self.from_torch(state_tiles(lanes))
         self._state_mid = self.from_torch(
@@ -181,14 +180,9 @@ class TTLangDiscreteSweepRuntime:
         return self.ttnn.to_torch(current).to(_torch().bfloat16)
 
     def read_state_lists(self) -> tuple[list[Any], list[Any]]:
-        lanes = (
-            self.materialize_state()
-            .to(_torch().float32)
-            .cpu()
-            .numpy()
-            .reshape(self.executor.layout.total_lanes, TILE, TILE)[:, 0, 0]
-        )
-        decoded = decode_state(self.executor.layout, lanes.astype(np.float32))
+        host_state = self.materialize_state().to(_torch().float32).cpu().tolist()
+        lanes = [host_state[lane * TILE][0] for lane in range(self.executor.layout.total_lanes)]
+        decoded = decode_state(self.executor.layout, lanes)
         n_free = len(self.executor.program.gibbs_spec.free_blocks)
         return list(decoded[:n_free]), list(decoded[n_free:])
 

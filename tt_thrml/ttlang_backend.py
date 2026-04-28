@@ -18,7 +18,7 @@ floats. Only the device-resident backend state changes shape.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, Sequence
+from typing import Any, Iterable, Sequence
 
 import numpy as np
 from thrml.block_sampling import BlockSamplingProgram
@@ -364,7 +364,7 @@ def encode_state(layout: TTLangStateLayout, block_states: Sequence[object]) -> n
     return lanes
 
 
-def decode_state(layout: TTLangStateLayout, lanes: np.ndarray) -> list[np.ndarray]:
+def decode_state(layout: TTLangStateLayout, lanes: Any) -> list[np.ndarray]:
     """Decode a complete TT-Lang backend state vector into THRML block states."""
     flat = np.asarray(lanes, dtype=np.float32).reshape(-1)
     if flat.shape[0] != layout.total_lanes:

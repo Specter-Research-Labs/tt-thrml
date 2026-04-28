@@ -40,8 +40,7 @@ def _missing_runtime_bridge_error() -> RuntimeError:
     required = ", ".join(_RUNTIME_BRIDGE_NAMES)
     return RuntimeError(
         "ttrt.runtime does not expose the TTNN runtime bridge APIs required for device-resident execution "
-        f"({required}). Use a TT-MLIR/TTRT build that includes the TTNN bridge bindings; no host-tensor "
-        "fallback is available."
+        f"({required}). Use a TT-MLIR/TTRT build that includes the TTNN bridge bindings."
     )
 
 

@@ -186,20 +186,6 @@ class TTLangDiscreteSweepRuntime:
         n_free = len(self.executor.program.gibbs_spec.free_blocks)
         return list(decoded[:n_free]), list(decoded[n_free:])
 
-    def sample_states(self, *args: Any, **kwargs: Any) -> Any:
-        raise NotImplementedError(
-            "TT-Lang is the primary executor path, but schedule-level sampling is not implemented yet. "
-            "Use load_state/run_sweep/run_sweeps for the supported discrete runtime, or make_ttmlir_executor "
-            "for legacy schedule-level comparisons."
-        )
-
-    def sample_with_observation(self, *args: Any, **kwargs: Any) -> Any:
-        raise NotImplementedError(
-            "TT-Lang is the primary executor path, but observer sampling is not implemented yet. "
-            "Use load_state/run_sweep/run_sweeps for the supported discrete runtime, or make_ttmlir_executor "
-            "for legacy observer comparisons."
-        )
-
     def from_torch(self, tensor: Any):
         return self.ttnn.from_torch(
             tensor,

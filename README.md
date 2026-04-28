@@ -5,7 +5,7 @@
 Upstream `thrml` owns model authoring, blocks, samplers, and schedules. `tt-thrml` owns:
 - TT-Lang-first execution for supported THRML program shapes
 - device-resident backend state across sweeps
-- legacy TT-MLIR execution for comparisons while the TT-Lang path broadens
+- explicit TT-MLIR execution for comparisons while the TT-Lang path broadens
 
 ## Public Surface
 
@@ -21,8 +21,6 @@ The intended API is intentionally small:
 - `tt_thrml.make_ttmlir_executor`
 - `tt_thrml.TTMLIRConfig`
 - `tt_thrml.make_ttmlir_config`
-- `tt_thrml.sample_states`
-- `tt_thrml.sample_with_observation`
 - `tt_thrml.GaussianConditional`
 
 Everything else should be treated as compiler/runtime internals.
@@ -31,7 +29,7 @@ Everything else should be treated as compiler/runtime internals.
 
 `make_executor` is TT-Lang-first. It builds the hardware-proven TT-Lang
 executor for the supported mixed discrete program shape and fails clearly for
-unsupported shapes instead of silently falling back to the legacy backend.
+unsupported shapes instead of switching execution paths implicitly.
 
 `make_ttmlir_executor` keeps the older TT-MLIR/TTRT path available for parity
 and performance comparisons. That path compiles each THRML program once to a
@@ -96,10 +94,11 @@ j-quietbox-ttlang-discrete-runtime-plan-derived-kernels-b-if69dh
 j-quietbox-ttlang-primary-make-executor-bench-ifdt3v
 j-quietbox-ttlang-primary-executor-state-api-bench-ifoy44
 j-quietbox-ttlang-runtime-no-numpy-bench-ii3rtc
+j-quietbox-ttlang-public-api-cleanup-container-bench-iidn8l
 ```
 
 The latest final-state-checked nonzero-randomness 50-sweep TT-Lang benchmark
-measured 32.03 ms total, or 0.641 ms/sweep, for the current narrow
+measured 32.08 ms total, or 0.642 ms/sweep, for the current narrow
 implementation. It still uses six dispatches per sweep, so this is a baseline
 before fusing group copy/update work.
 
@@ -114,9 +113,9 @@ while THRML's spin update uses a strict `>` decision whose tie result is the
 negative spin. The runner encodes the strict decision as
 `sign(sign(x) - 0.5)`, avoiding `where` while preserving THRML tie behavior.
 
-Before making TT-Lang the default backend, compare it against the current
-TT-MLIR/TTRT backend on the same Wormhole for spin-only, categorical-only, and
-mixed workloads, measuring compile time, first-sweep latency, steady-state
+Before deleting the TT-MLIR comparison path, compare it against the TT-Lang
+executor on the same Wormhole for spin-only, categorical-only, and mixed
+workloads, measuring compile time, first-sweep latency, steady-state
 milliseconds per sweep, dispatch count, transfer count, and parity against the
 CPU sampler.
 
@@ -137,34 +136,24 @@ TTNN, TTRT, and TT-MLIR remain environment-provided dependencies. Use a Tenstorr
 ## Quick Start
 
 ```python
-import jax
-import thrml
 import ttnn
 
 import tt_thrml
+from tt_thrml.example_programs import make_mixed_spin_categorical_gaussian_program
 
-key = jax.random.key(0)
-schedule = thrml.SamplingSchedule(n_warmup=32, n_samples=64, steps_per_sample=2)
-
-config = tt_thrml.make_ttmlir_config(
-    system_desc_path="/path/to/system_desc.ttsys",
-    artifact_root="/tmp/tt-thrml-artifacts",
-    build_dir="/path/to/tt-mlir/build",
-)
+program = make_mixed_spin_categorical_gaussian_program()
+initial_state = [[True], [2], [0.25], [False], [0], [-0.5]]
 
 device = tt_thrml.open_device(ttnn, device_id=0)
 try:
-    samples = tt_thrml.sample_states(
-        key,
-        program,
-        schedule,
-        init_state_free,
-        state_clamp,
-        [thrml.Block(nodes_to_sample)],
-        ttnn=ttnn,
-        device=device,
-        config=config,
+    executor = tt_thrml.make_executor(ttnn, device, program)
+    executor.load_state(initial_state)
+    executor.set_sweep_randomness(
+        spin_threshold_logits={0: 0.0, 3: 0.0},
+        categorical_gumbel={1: [0.0, 0.0, 0.0], 4: [0.0, 0.0, 0.0]},
     )
+    executor.run_sweeps(50)
+    free_state, clamped_state = executor.read_state_lists()
 finally:
     tt_thrml.close_device(ttnn, device)
 ```

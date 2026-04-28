@@ -1,6 +1,7 @@
 """Tenstorrent execution backend for THRML.
 
-One fused kernel per sampling group. Bulk RNG uploaded once. Zero host readback mid-sweep.
+TT-Lang is the primary execution path for supported program shapes. TT-MLIR is
+kept as an explicit comparison path while TT-Lang coverage broadens.
 """
 
 from .compiler import compile_program
@@ -34,56 +35,6 @@ from .ttlang_runtime import (
     validate_ttlang_discrete_runtime,
 )
 
-
-def sample_states(
-    key,
-    program,
-    schedule,
-    init_state_free,
-    state_clamp,
-    nodes_to_sample,
-    *,
-    ttnn,
-    device,
-    config: TTMLIRConfig,
-):
-    """Legacy TT-MLIR sampling API matching thrml.sample_states."""
-    executor = make_ttmlir_executor(ttnn, device, program, config)
-    return executor.sample_states(
-        key,
-        schedule,
-        nodes_to_sample,
-        init_state_free=init_state_free,
-        state_clamp=state_clamp,
-    )
-
-
-def sample_with_observation(
-    key,
-    program,
-    schedule,
-    init_state_free,
-    state_clamp,
-    observation_carry_init,
-    f_observe,
-    *,
-    ttnn,
-    device,
-    config: TTMLIRConfig,
-):
-    """Legacy TT-MLIR observer sampling API matching thrml.sample_with_observation."""
-    executor = make_ttmlir_executor(ttnn, device, program, config)
-    carry, results = executor.sample_with_observation(
-        key,
-        schedule,
-        f_observe,
-        init_state_free=init_state_free,
-        state_clamp=state_clamp,
-        observation_carry_init=observation_carry_init,
-    )
-    return carry, results
-
-
 __all__ = [
     "TTMLIRConfig",
     "make_ttmlir_config",
@@ -98,8 +49,6 @@ __all__ = [
     "make_ttmlir_executor",
     "MeshExecutor",
     "make_mesh_executor",
-    "sample_states",
-    "sample_with_observation",
     "GaussianConditional",
     "TTLangDiscreteSweepRuntime",
     "make_primary_ttlang_executor",

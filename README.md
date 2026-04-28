@@ -82,9 +82,11 @@ j-quietbox-ttlang-discrete-sweep-hw-copy3-hjmuox
 j-quietbox-ttlang-discrete-sweep-bench-50-hjvh1e
 j-quietbox-ttlang-discrete-sweep-bench-50-after-reboot-hkw0q6
 j-quietbox-ttmlir-demo-profile-after-reboot-hkwz4n
+j-quietbox-ttlang-discrete-runtime-hw-globalttl-idpbb3
+j-quietbox-ttlang-discrete-runtime-bench-50-idogfw
 ```
 
-The latest 50-sweep TT-Lang benchmark measured 32.12 ms total, or 0.642
+The latest 50-sweep TT-Lang benchmark measured 31.90 ms total, or 0.638
 ms/sweep, for the current narrow implementation. It still uses six dispatches
 per sweep, so this is a baseline before fusing group copy/update work.
 

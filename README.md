@@ -32,7 +32,7 @@ The current hardware-proven path supports the mixed discrete smoke shape:
 - categorical target from signed spin source lanes
 - two Gibbs sampling groups
 - device-resident 10-lane TT-Lang state across sweeps
-- six TT-Lang dispatches per sweep
+- two TT-Lang dispatches per sweep
 
 Host-facing THRML state remains booleans, category ids, and floats. Device state
 is lowered into TT-Lang lanes:
@@ -98,14 +98,14 @@ podman run -d --privileged --network host --name tt-lang-codex \
 Current cleanup HEAD passed on QuietBox:
 
 ```text
-j-quietbox-ttlang-after-board-reset-bench-in8osz
+j-quietbox-ttlang-fused-group-bench-inv8is
 PASS: TT-Lang THRML discrete sweep
 2 warmup sweeps, 10 measured sweeps
-6.99 ms total, 0.699 ms/sweep, 6 dispatches/sweep
+3.51 ms total, 0.351 ms/sweep, 2 dispatches/sweep
 ```
 
-Earlier warm-container runs of the same TT-Lang path measured about
-0.64-0.66 ms/sweep.
+The prior 6-dispatch runtime measured 6.99 ms total, 0.699 ms/sweep on the
+same 2-warmup/10-measured QuietBox benchmark.
 
 ## Randomness
 

@@ -95,13 +95,12 @@ def make_primary_ttlang_executor(
 class TTLangDiscreteSweepRuntime:
     """Device-resident executor for the current supported TT-Lang sweep shape.
 
-    This class intentionally wraps only the hardware-proven path: copy the
-    pre-group state, then run independent spin and categorical block updates for
-    each sampling group. It is a stable executor-shaped surface we can optimize
-    behind without changing the runner contract.
+    This class intentionally wraps only the hardware-proven path: each sampling
+    group reads the pre-group state snapshot, preserves untouched lanes, and
+    computes one spin plus one categorical update.
     """
 
-    dispatches_per_sweep = 6
+    dispatches_per_sweep = 2
 
     def __init__(self, *, ttl: Any, ttnn: Any, device: Any, executor: "TTLangProgramPlanner"):
         validate_ttlang_discrete_runtime(executor)
@@ -114,7 +113,11 @@ class TTLangDiscreteSweepRuntime:
         categorical_plans = {plan.block_index: plan for plan in executor.categorical_spin_plans}
         self.groups = _make_runtime_groups(executor, spin_plans, categorical_plans)
         self.operations = _define_operations(
-            ttl, spin_plans, categorical_plans, total_lanes=executor.layout.total_lanes
+            ttl,
+            spin_plans,
+            categorical_plans,
+            groups=self.groups,
+            total_lanes=executor.layout.total_lanes,
         )
         self.constants = self._make_constants(spin_plans, categorical_plans)
         self._state_current: Any | None = None
@@ -248,30 +251,20 @@ class TTLangDiscreteSweepRuntime:
         for group_index, group in enumerate(self.groups):
             group_in = state_buffers[group_index]
             group_out = state_buffers[group_index + 1]
-            ops.copy_state(group_in, group_out)
-
-            spin_block = group.spin_block
-            if spin_block is not None:
-                ops.spin_updates[spin_block](
-                    group_in,
-                    constants[_spin_key(spin_block, "weights")],
-                    constants[_spin_key(spin_block, "bias")],
-                    constants[_spin_key(spin_block, "threshold")],
-                    constants["half"],
-                    group_out,
-                )
-
-            categorical_block = group.categorical_block
-            if categorical_block is not None:
-                ops.categorical_updates[categorical_block](
-                    group_in,
-                    constants[_categorical_key(categorical_block, "weights")],
-                    constants[_categorical_key(categorical_block, "bias")],
-                    constants[_categorical_key(categorical_block, "gumbel")],
-                    constants["one"],
-                    constants["half"],
-                    group_out,
-                )
+            spin_block = _require_block(group.spin_block, "spin", group)
+            categorical_block = _require_block(group.categorical_block, "categorical", group)
+            ops.group_updates[group_index](
+                group_in,
+                constants[_spin_key(spin_block, "weights")],
+                constants[_spin_key(spin_block, "bias")],
+                constants[_spin_key(spin_block, "threshold")],
+                constants[_categorical_key(categorical_block, "weights")],
+                constants[_categorical_key(categorical_block, "bias")],
+                constants[_categorical_key(categorical_block, "gumbel")],
+                constants["one"],
+                constants["half"],
+                group_out,
+            )
 
     def _require_state(self) -> tuple[Any, Any, Any]:
         if self._state_current is None or self._state_mid is None or self._state_next is None:
@@ -293,10 +286,8 @@ class _RuntimeGroup:
 
 
 class _Operations:
-    def __init__(self, *, copy_state, spin_updates: dict[int, Any], categorical_updates: dict[int, Any]):
-        self.copy_state = copy_state
-        self.spin_updates = spin_updates
-        self.categorical_updates = categorical_updates
+    def __init__(self, *, group_updates: tuple[Any, ...]):
+        self.group_updates = group_updates
 
 
 def _spin_key(block_index: int, name: str) -> str:
@@ -326,119 +317,92 @@ def _make_runtime_groups(
     return tuple(groups)
 
 
+def _require_block(block_index: int | None, family: str, group: _RuntimeGroup) -> int:
+    if block_index is None:
+        raise RuntimeError(f"TT-Lang runtime group is missing {family} block: {group}")
+    return block_index
+
+
 def _define_operations(
-    ttl_module: Any, spin_plans: dict[int, Any], categorical_plans: dict[int, Any], *, total_lanes: int
+    ttl_module: Any,
+    spin_plans: dict[int, Any],
+    categorical_plans: dict[int, Any],
+    *,
+    groups: tuple[_RuntimeGroup, ...],
+    total_lanes: int,
 ) -> _Operations:
     global ttl
     ttl = ttl_module
 
-    def define_copy_state(n_lanes: int):
+    def define_group_update(
+        *,
+        n_lanes: int,
+        spin_source_start: int,
+        spin_output_lane: int,
+        categorical_source_lane: int,
+        categorical_output_start: int,
+    ):
         @ttl.operation(grid=(1, 1))
-        def copy_state(inp, out):
-            lane_dfb = ttl.make_dataflow_buffer_like(inp, shape=(1, 1), block_count=n_lanes)
-
-            @ttl.compute()
-            def compute():
-                pass
-
-            @ttl.datamovement()
-            def read():
-                for lane in range(n_lanes):
-                    with lane_dfb.reserve() as lane_blk:
-                        tx_in = ttl.copy(inp[lane, 0], lane_blk)
-                        tx_in.wait()
-
-            @ttl.datamovement()
-            def write():
-                for lane in range(n_lanes):
-                    with lane_dfb.wait() as lane_blk:
-                        tx_out = ttl.copy(lane_blk, out[lane, 0])
-                        tx_out.wait()
-
-        return copy_state
-
-    def define_spin_update(source_start: int, output_lane: int):
-        @ttl.operation(grid=(1, 1))
-        def spin_update(state, weights, bias, threshold_logits, half, out):
+        def group_update(
+            state,
+            spin_weights,
+            spin_bias,
+            threshold_logits,
+            categorical_weights,
+            categorical_bias,
+            gumbel,
+            one,
+            half,
+            out,
+        ):
+            copy_dfb = ttl.make_dataflow_buffer_like(state, shape=(1, 1), block_count=n_lanes)
             cat_state_dfb = ttl.make_dataflow_buffer_like(state, shape=(1, 1), block_count=2)
-            weights_dfb = ttl.make_dataflow_buffer_like(weights, shape=(1, 1), block_count=2)
-            bias_dfb = ttl.make_dataflow_buffer_like(bias, shape=(1, 1), block_count=2)
+            spin_weights_dfb = ttl.make_dataflow_buffer_like(spin_weights, shape=(1, 1), block_count=2)
+            spin_bias_dfb = ttl.make_dataflow_buffer_like(spin_bias, shape=(1, 1), block_count=2)
             threshold_dfb = ttl.make_dataflow_buffer_like(threshold_logits, shape=(1, 1), block_count=2)
-            half_dfb = ttl.make_dataflow_buffer_like(half, shape=(1, 1), block_count=2)
-            out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), block_count=2)
-
-            @ttl.compute()
-            def compute():
-                with out_dfb.reserve() as out_blk:
-                    with bias_dfb.wait() as bias_blk:
-                        out_blk.store(bias_blk)
-                    for _ in range(3):
-                        with cat_state_dfb.wait() as cat_state_blk, weights_dfb.wait() as weights_blk:
-                            out_blk += cat_state_blk * weights_blk
-                    with threshold_dfb.wait() as threshold_blk, half_dfb.wait() as half_blk:
-                        decision = ttl.math.sign(out_blk + out_blk - threshold_blk)
-                        out_blk.store(ttl.math.sign(decision - half_blk))
-
-            @ttl.datamovement()
-            def read():
-                with bias_dfb.reserve() as bias_blk:
-                    tx_bias = ttl.copy(bias[0, 0], bias_blk)
-                    tx_bias.wait()
-                for category in range(3):
-                    with cat_state_dfb.reserve() as cat_state_blk, weights_dfb.reserve() as weights_blk:
-                        tx_state = ttl.copy(state[source_start + category, 0], cat_state_blk)
-                        tx_weights = ttl.copy(weights[category, 0], weights_blk)
-                        tx_state.wait()
-                        tx_weights.wait()
-                with threshold_dfb.reserve() as threshold_blk:
-                    tx_threshold = ttl.copy(threshold_logits[0, 0], threshold_blk)
-                    tx_threshold.wait()
-                with half_dfb.reserve() as half_blk:
-                    tx_half = ttl.copy(half[0, 0], half_blk)
-                    tx_half.wait()
-
-            @ttl.datamovement()
-            def write():
-                with out_dfb.wait() as out_blk:
-                    tx_out = ttl.copy(out_blk, out[output_lane, 0])
-                    tx_out.wait()
-
-        return spin_update
-
-    def define_categorical_update(source_lane: int, output_start: int):
-        @ttl.operation(grid=(1, 1))
-        def categorical_update(state, weights, bias, gumbel, one, half, out):
+            spin_half_dfb = ttl.make_dataflow_buffer_like(half, shape=(1, 1), block_count=2)
+            spin_out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), block_count=2)
             spin_dfb = ttl.make_dataflow_buffer_like(state, shape=(1, 1), block_count=2)
-            weights_dfb = ttl.make_dataflow_buffer_like(weights, shape=(1, 1), block_count=2)
-            bias_dfb = ttl.make_dataflow_buffer_like(bias, shape=(1, 1), block_count=2)
+            categorical_weights_dfb = ttl.make_dataflow_buffer_like(categorical_weights, shape=(1, 1), block_count=2)
+            categorical_bias_dfb = ttl.make_dataflow_buffer_like(categorical_bias, shape=(1, 1), block_count=2)
             gumbel_dfb = ttl.make_dataflow_buffer_like(gumbel, shape=(1, 1), block_count=2)
             score0_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), block_count=2)
             score1_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), block_count=2)
             score2_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), block_count=2)
             one_dfb = ttl.make_dataflow_buffer_like(one, shape=(1, 1), block_count=2)
-            half_dfb = ttl.make_dataflow_buffer_like(half, shape=(1, 1), block_count=2)
-            out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), block_count=2)
+            categorical_half_dfb = ttl.make_dataflow_buffer_like(half, shape=(1, 1), block_count=2)
+            categorical_out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), block_count=2)
 
             @ttl.compute()
             def compute():
+                with spin_out_dfb.reserve() as out_blk:
+                    with spin_bias_dfb.wait() as bias_blk:
+                        out_blk.store(bias_blk)
+                    for _ in range(3):
+                        with cat_state_dfb.wait() as cat_state_blk, spin_weights_dfb.wait() as weights_blk:
+                            out_blk += cat_state_blk * weights_blk
+                    with threshold_dfb.wait() as threshold_blk, spin_half_dfb.wait() as half_blk:
+                        decision = ttl.math.sign(out_blk + out_blk - threshold_blk)
+                        out_blk.store(ttl.math.sign(decision - half_blk))
+
                 with spin_dfb.wait() as spin_blk:
                     with (
-                        weights_dfb.wait() as weights_blk,
-                        bias_dfb.wait() as bias_blk,
+                        categorical_weights_dfb.wait() as weights_blk,
+                        categorical_bias_dfb.wait() as bias_blk,
                         gumbel_dfb.wait() as gumbel_blk,
                         score0_dfb.reserve() as score0_blk,
                     ):
                         score0_blk.store(bias_blk + gumbel_blk + spin_blk * weights_blk)
                     with (
-                        weights_dfb.wait() as weights_blk,
-                        bias_dfb.wait() as bias_blk,
+                        categorical_weights_dfb.wait() as weights_blk,
+                        categorical_bias_dfb.wait() as bias_blk,
                         gumbel_dfb.wait() as gumbel_blk,
                         score1_dfb.reserve() as score1_blk,
                     ):
                         score1_blk.store(bias_blk + gumbel_blk + spin_blk * weights_blk)
                     with (
-                        weights_dfb.wait() as weights_blk,
-                        bias_dfb.wait() as bias_blk,
+                        categorical_weights_dfb.wait() as weights_blk,
+                        categorical_bias_dfb.wait() as bias_blk,
                         gumbel_dfb.wait() as gumbel_blk,
                         score2_dfb.reserve() as score2_blk,
                     ):
@@ -449,34 +413,58 @@ def _define_operations(
                     score1_dfb.wait() as score1,
                     score2_dfb.wait() as score2,
                     one_dfb.wait() as one_blk,
-                    half_dfb.wait() as half_blk,
+                    categorical_half_dfb.wait() as half_blk,
                 ):
                     gt01 = (ttl.math.sign(score0 - score1) + one_blk) * half_blk
                     gt02 = (ttl.math.sign(score0 - score2) + one_blk) * half_blk
-                    with out_dfb.reserve() as out_blk:
+                    with categorical_out_dfb.reserve() as out_blk:
                         out_blk.store(gt01 * gt02)
 
                     gt10 = (ttl.math.sign(score1 - score0) + one_blk) * half_blk
                     gt12 = (ttl.math.sign(score1 - score2) + one_blk) * half_blk
-                    with out_dfb.reserve() as out_blk:
+                    with categorical_out_dfb.reserve() as out_blk:
                         out_blk.store(gt10 * gt12)
 
                     gt20 = (ttl.math.sign(score2 - score0) + one_blk) * half_blk
                     gt21 = (ttl.math.sign(score2 - score1) + one_blk) * half_blk
-                    with out_dfb.reserve() as out_blk:
+                    with categorical_out_dfb.reserve() as out_blk:
                         out_blk.store(gt20 * gt21)
 
             @ttl.datamovement()
             def read():
+                for lane in range(n_lanes):
+                    if lane != spin_output_lane and (
+                        lane < categorical_output_start or lane >= categorical_output_start + N_CATEGORIES
+                    ):
+                        with copy_dfb.reserve() as copy_blk:
+                            tx_copy = ttl.copy(state[lane, 0], copy_blk)
+                            tx_copy.wait()
+
+                with spin_bias_dfb.reserve() as bias_blk:
+                    tx_bias = ttl.copy(spin_bias[0, 0], bias_blk)
+                    tx_bias.wait()
+                for category in range(3):
+                    with cat_state_dfb.reserve() as cat_state_blk, spin_weights_dfb.reserve() as weights_blk:
+                        tx_state = ttl.copy(state[spin_source_start + category, 0], cat_state_blk)
+                        tx_weights = ttl.copy(spin_weights[category, 0], weights_blk)
+                        tx_state.wait()
+                        tx_weights.wait()
+                with threshold_dfb.reserve() as threshold_blk:
+                    tx_threshold = ttl.copy(threshold_logits[0, 0], threshold_blk)
+                    tx_threshold.wait()
+                with spin_half_dfb.reserve() as half_blk:
+                    tx_half = ttl.copy(half[0, 0], half_blk)
+                    tx_half.wait()
+
                 with spin_dfb.reserve() as spin_blk:
-                    tx_spin = ttl.copy(state[source_lane, 0], spin_blk)
+                    tx_spin = ttl.copy(state[categorical_source_lane, 0], spin_blk)
                     tx_spin.wait()
                 for category in range(3):
-                    with weights_dfb.reserve() as weights_blk:
-                        tx_weights = ttl.copy(weights[category, 0], weights_blk)
+                    with categorical_weights_dfb.reserve() as weights_blk:
+                        tx_weights = ttl.copy(categorical_weights[category, 0], weights_blk)
                         tx_weights.wait()
-                    with bias_dfb.reserve() as bias_blk:
-                        tx_bias = ttl.copy(bias[category, 0], bias_blk)
+                    with categorical_bias_dfb.reserve() as bias_blk:
+                        tx_bias = ttl.copy(categorical_bias[category, 0], bias_blk)
                         tx_bias.wait()
                     with gumbel_dfb.reserve() as gumbel_blk:
                         tx_gumbel = ttl.copy(gumbel[category, 0], gumbel_blk)
@@ -484,33 +472,44 @@ def _define_operations(
                 with one_dfb.reserve() as one_blk:
                     tx_one = ttl.copy(one[0, 0], one_blk)
                     tx_one.wait()
-                with half_dfb.reserve() as half_blk:
+                with categorical_half_dfb.reserve() as half_blk:
                     tx_half = ttl.copy(half[0, 0], half_blk)
                     tx_half.wait()
 
             @ttl.datamovement()
             def write():
+                for lane in range(n_lanes):
+                    if lane != spin_output_lane and (
+                        lane < categorical_output_start or lane >= categorical_output_start + N_CATEGORIES
+                    ):
+                        with copy_dfb.wait() as copy_blk:
+                            tx_copy = ttl.copy(copy_blk, out[lane, 0])
+                            tx_copy.wait()
+                with spin_out_dfb.wait() as out_blk:
+                    tx_out = ttl.copy(out_blk, out[spin_output_lane, 0])
+                    tx_out.wait()
                 for category in range(3):
-                    with out_dfb.wait() as out_blk:
-                        tx_out = ttl.copy(out_blk, out[output_start + category, 0])
+                    with categorical_out_dfb.wait() as out_blk:
+                        tx_out = ttl.copy(out_blk, out[categorical_output_start + category, 0])
                         tx_out.wait()
 
-        return categorical_update
+        return group_update
 
     return _Operations(
-        copy_state=define_copy_state(total_lanes),
-        spin_updates={
-            block_index: define_spin_update(
-                source_start=plan.categorical_lane_groups[0][0],
-                output_lane=plan.output_lane,
+        group_updates=tuple(
+            define_group_update(
+                n_lanes=total_lanes,
+                spin_source_start=spin_plans[_require_block(group.spin_block, "spin", group)].categorical_lane_groups[
+                    0
+                ][0],
+                spin_output_lane=spin_plans[_require_block(group.spin_block, "spin", group)].output_lane,
+                categorical_source_lane=categorical_plans[
+                    _require_block(group.categorical_block, "categorical", group)
+                ].spin_lanes[0],
+                categorical_output_start=categorical_plans[
+                    _require_block(group.categorical_block, "categorical", group)
+                ].output_lanes[0],
             )
-            for block_index, plan in sorted(spin_plans.items())
-        },
-        categorical_updates={
-            block_index: define_categorical_update(
-                source_lane=plan.spin_lanes[0],
-                output_start=plan.output_lanes[0],
-            )
-            for block_index, plan in sorted(categorical_plans.items())
-        },
+            for group in groups
+        )
     )

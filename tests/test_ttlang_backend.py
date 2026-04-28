@@ -21,7 +21,12 @@ from tt_thrml.ttlang_backend import (
     make_sweep_randomness_from_key,
     make_sweep_randomness_window_from_key,
 )
-from tt_thrml.ttlang_runtime import supports_ttlang_discrete_runtime, validate_ttlang_discrete_runtime
+from tt_thrml.ttlang_runtime import (
+    _can_fuse_groups,
+    _make_runtime_groups,
+    supports_ttlang_discrete_runtime,
+    validate_ttlang_discrete_runtime,
+)
 
 
 def test_ttlang_state_layout_expands_categorical_blocks_to_one_hot_lanes():
@@ -363,6 +368,16 @@ def test_ttlang_runtime_supports_more_independent_sampling_groups():
     executor.sampling_order = executor.sampling_order[:2]
     with pytest.raises(ValueError, match="omits planned blocks"):
         validate_ttlang_discrete_runtime(executor)
+
+
+def test_ttlang_runtime_can_fuse_regular_independent_groups():
+    program = make_mixed_spin_categorical_gaussian_program(n_pairs=3)
+    executor = TTLangProgramPlanner(program)
+    spin_plans = {plan.block_index: plan for plan in executor.spin_categorical_plans}
+    categorical_plans = {plan.block_index: plan for plan in executor.categorical_spin_plans}
+    groups = _make_runtime_groups(executor, spin_plans, categorical_plans)
+
+    assert _can_fuse_groups(groups, spin_plans, categorical_plans)
 
 
 def test_ttlang_planner_combines_duplicate_discrete_terms():

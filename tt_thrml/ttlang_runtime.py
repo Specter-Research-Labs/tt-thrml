@@ -122,7 +122,9 @@ class TTLangDiscreteSweepRuntime:
         self.spin_plans = spin_plans
         self.categorical_plans = categorical_plans
         self.groups = _make_runtime_groups(executor, spin_plans, categorical_plans)
-        self.dispatches_per_sweep = len(self.groups)
+        self.dispatches_per_sweep = (
+            1 if _can_fuse_groups(self.groups, spin_plans, categorical_plans) else len(self.groups)
+        )
         self.operations = _define_operations(
             ttl,
             spin_plans,
@@ -171,6 +173,15 @@ class TTLangDiscreteSweepRuntime:
             self.constants[_spin_key(block_index, "threshold")] = self.from_torch(
                 torch.full((TILE, TILE), value, dtype=torch.bfloat16)
             )
+        if _fused_key("spin_threshold") in self.constants:
+            self.constants[_fused_key("spin_threshold")] = self.from_torch(
+                tile_planes(
+                    [
+                        float(spin_threshold_logits_by_block.get(_require_block(group.spin_block, "spin", group), 0.0))
+                        for group in self.groups
+                    ]
+                )
+            )
 
         for block_index in sorted(categorical_blocks):
             plan = self.categorical_plans[block_index]
@@ -181,6 +192,14 @@ class TTLangDiscreteSweepRuntime:
             if len(values) != plan.n_categories:
                 raise ValueError(f"TT-Lang categorical gumbel block {block_index} expects {plan.n_categories} values")
             self.constants[_categorical_key(block_index, "gumbel")] = self.from_torch(tile_planes(list(values)))
+        if _fused_key("categorical_gumbel") in self.constants:
+            fused_gumbel = []
+            for group in self.groups:
+                block_index = _require_block(group.categorical_block, "categorical", group)
+                plan = self.categorical_plans[block_index]
+                raw_values = categorical_gumbel_by_block.get(block_index, tuple(0.0 for _ in range(plan.n_categories)))
+                fused_gumbel.extend(float(v) for v in raw_values)
+            self.constants[_fused_key("categorical_gumbel")] = self.from_torch(tile_planes(fused_gumbel))
 
     def set_sweep_randomness_from_key(self, key: Any) -> None:
         """Upload one sweep of random inputs using THRML's JAX key schedule."""
@@ -217,6 +236,16 @@ class TTLangDiscreteSweepRuntime:
             if len(values) != randomness_window.n_sweeps:
                 raise ValueError(f"TT-Lang spin threshold block {block_index} has the wrong window length")
             self.constants[_spin_key(block_index, "threshold")] = self.from_torch(tile_planes(list(values)))
+        if _fused_key("spin_threshold") in self.constants:
+            fused_threshold = []
+            for sweep_index in range(randomness_window.n_sweeps):
+                for group in self.groups:
+                    block_index = _require_block(group.spin_block, "spin", group)
+                    values = randomness_window.spin_threshold_logits.get(
+                        block_index, (0.0,) * randomness_window.n_sweeps
+                    )
+                    fused_threshold.append(float(values[sweep_index]))
+            self.constants[_fused_key("spin_threshold")] = self.from_torch(tile_planes(fused_threshold))
 
         for block_index in sorted(categorical_blocks):
             plan = self.categorical_plans[block_index]
@@ -236,6 +265,17 @@ class TTLangDiscreteSweepRuntime:
             self.constants[_categorical_key(block_index, "gumbel")] = self.from_torch(
                 tile_planes([value for values in sweeps for value in values])
             )
+        if _fused_key("categorical_gumbel") in self.constants:
+            fused_gumbel = []
+            for sweep_index in range(randomness_window.n_sweeps):
+                for group in self.groups:
+                    block_index = _require_block(group.categorical_block, "categorical", group)
+                    plan = self.categorical_plans[block_index]
+                    sweeps = randomness_window.categorical_gumbel.get(
+                        block_index, ((0.0,) * plan.n_categories,) * randomness_window.n_sweeps
+                    )
+                    fused_gumbel.extend(float(value) for value in sweeps[sweep_index])
+            self.constants[_fused_key("categorical_gumbel")] = self.from_torch(tile_planes(fused_gumbel))
 
         self._randomness_window_length = int(randomness_window.n_sweeps)
         self._randomness_cursor = 0
@@ -315,11 +355,53 @@ class TTLangDiscreteSweepRuntime:
                 tile_planes(list(plan.spin_weights[0]))
             )
             constants[_categorical_key(block_index, "bias")] = self.from_torch(tile_planes(list(plan.bias)))
+        if _can_fuse_groups(self.groups, spin_plans, categorical_plans):
+            constants.update(self._make_fused_constants(spin_plans, categorical_plans))
         return constants
+
+    def _make_fused_constants(self, spin_plans: dict[int, Any], categorical_plans: dict[int, Any]) -> dict[str, Any]:
+        torch = _torch()
+        spin_weights = []
+        spin_bias = []
+        categorical_weights = []
+        categorical_bias = []
+        for group in self.groups:
+            spin_plan = spin_plans[_require_block(group.spin_block, "spin", group)]
+            categorical_plan = categorical_plans[_require_block(group.categorical_block, "categorical", group)]
+            spin_weights.extend(spin_plan.categorical_weights[0])
+            spin_bias.append(spin_plan.bias)
+            categorical_weights.extend(categorical_plan.spin_weights[0])
+            categorical_bias.extend(categorical_plan.bias)
+        return {
+            _fused_key("spin_weights"): self.from_torch(tile_planes(list(spin_weights))),
+            _fused_key("spin_bias"): self.from_torch(tile_planes(list(spin_bias))),
+            _fused_key("spin_threshold"): self.from_torch(
+                torch.zeros((len(self.groups) * TILE, TILE), dtype=torch.bfloat16)
+            ),
+            _fused_key("categorical_weights"): self.from_torch(tile_planes(list(categorical_weights))),
+            _fused_key("categorical_bias"): self.from_torch(tile_planes(list(categorical_bias))),
+            _fused_key("categorical_gumbel"): self.from_torch(
+                torch.zeros((len(self.groups) * N_CATEGORIES * TILE, TILE), dtype=torch.bfloat16)
+            ),
+        }
 
     def _run_discrete_sweep(self, state: Any, *, window_slot: int | None = None) -> None:
         ops = self.operations if window_slot is None else self._operations_for_window_slot(window_slot)
         constants = self.constants
+        if ops.fused_update is not None:
+            ops.fused_update(
+                state,
+                constants[_fused_key("spin_weights")],
+                constants[_fused_key("spin_bias")],
+                constants[_fused_key("spin_threshold")],
+                constants[_fused_key("categorical_weights")],
+                constants[_fused_key("categorical_bias")],
+                constants[_fused_key("categorical_gumbel")],
+                constants["one"],
+                constants["half"],
+                state,
+            )
+            return
         for group_index, group in enumerate(self.groups):
             spin_block = _require_block(group.spin_block, "spin", group)
             categorical_block = _require_block(group.categorical_block, "categorical", group)
@@ -369,8 +451,9 @@ class _RuntimeGroup:
 
 
 class _Operations:
-    def __init__(self, *, group_updates: tuple[Any, ...]):
+    def __init__(self, *, group_updates: tuple[Any, ...], fused_update: Any | None = None):
         self.group_updates = group_updates
+        self.fused_update = fused_update
 
 
 def _spin_key(block_index: int, name: str) -> str:
@@ -379,6 +462,10 @@ def _spin_key(block_index: int, name: str) -> str:
 
 def _categorical_key(block_index: int, name: str) -> str:
     return f"categorical:{block_index}:{name}"
+
+
+def _fused_key(name: str) -> str:
+    return f"fused:{name}"
 
 
 def _make_runtime_groups(
@@ -418,6 +505,26 @@ def _group_write_lanes(group: _RuntimeGroup, spin_plans: dict[int, Any], categor
     return {spin_plan.output_lane} | set(categorical_plan.output_lanes)
 
 
+def _can_fuse_groups(
+    groups: tuple[_RuntimeGroup, ...], spin_plans: dict[int, Any], categorical_plans: dict[int, Any]
+) -> bool:
+    if len(groups) <= 1:
+        return False
+    for group_index, group in enumerate(groups):
+        spin_plan = spin_plans[_require_block(group.spin_block, "spin", group)]
+        categorical_plan = categorical_plans[_require_block(group.categorical_block, "categorical", group)]
+        lane_start = group_index * 5
+        if spin_plan.output_lane != lane_start:
+            return False
+        if spin_plan.categorical_lane_groups != ((lane_start + 1, lane_start + 2, lane_start + 3),):
+            return False
+        if categorical_plan.spin_lanes != (lane_start,):
+            return False
+        if categorical_plan.output_lanes != (lane_start + 1, lane_start + 2, lane_start + 3):
+            return False
+    return True
+
+
 def _define_operations(
     ttl_module: Any,
     spin_plans: dict[int, Any],
@@ -430,6 +537,14 @@ def _define_operations(
     ttl = ttl_module
     threshold_row = 0 if window_slot is None else window_slot
     gumbel_row_start = 0 if window_slot is None else window_slot * N_CATEGORIES
+    if _can_fuse_groups(groups, spin_plans, categorical_plans):
+        return _Operations(
+            group_updates=(),
+            fused_update=_define_fused_group_update(
+                n_groups=len(groups),
+                window_slot=window_slot,
+            ),
+        )
 
     def define_group_update(
         *,
@@ -592,3 +707,153 @@ def _define_operations(
             for group in groups
         )
     )
+
+
+def _define_fused_group_update(*, n_groups: int, window_slot: int | None):
+    threshold_base = 0 if window_slot is None else window_slot * n_groups
+    gumbel_base = 0 if window_slot is None else window_slot * n_groups * N_CATEGORIES
+
+    @ttl.operation(grid=(n_groups, 1))
+    def fused_group_update(
+        state,
+        spin_weights,
+        spin_bias,
+        threshold_logits,
+        categorical_weights,
+        categorical_bias,
+        gumbel,
+        one,
+        half,
+        out,
+    ):
+        cat_state_dfb = ttl.make_dataflow_buffer_like(state, shape=(1, 1), block_count=2)
+        spin_weights_dfb = ttl.make_dataflow_buffer_like(spin_weights, shape=(1, 1), block_count=2)
+        spin_bias_dfb = ttl.make_dataflow_buffer_like(spin_bias, shape=(1, 1), block_count=2)
+        threshold_dfb = ttl.make_dataflow_buffer_like(threshold_logits, shape=(1, 1), block_count=2)
+        spin_half_dfb = ttl.make_dataflow_buffer_like(half, shape=(1, 1), block_count=2)
+        spin_out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), block_count=2)
+        spin_dfb = ttl.make_dataflow_buffer_like(state, shape=(1, 1), block_count=2)
+        categorical_weights_dfb = ttl.make_dataflow_buffer_like(categorical_weights, shape=(1, 1), block_count=2)
+        categorical_bias_dfb = ttl.make_dataflow_buffer_like(categorical_bias, shape=(1, 1), block_count=2)
+        gumbel_dfb = ttl.make_dataflow_buffer_like(gumbel, shape=(1, 1), block_count=2)
+        score0_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), block_count=2)
+        score1_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), block_count=2)
+        score2_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), block_count=2)
+        one_dfb = ttl.make_dataflow_buffer_like(one, shape=(1, 1), block_count=2)
+        categorical_half_dfb = ttl.make_dataflow_buffer_like(half, shape=(1, 1), block_count=2)
+        categorical_out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), block_count=2)
+
+        @ttl.compute()
+        def compute():
+            with spin_out_dfb.reserve() as out_blk:
+                with spin_bias_dfb.wait() as bias_blk:
+                    out_blk.store(bias_blk)
+                for _ in range(3):
+                    with cat_state_dfb.wait() as cat_state_blk, spin_weights_dfb.wait() as weights_blk:
+                        out_blk += cat_state_blk * weights_blk
+                with threshold_dfb.wait() as threshold_blk, spin_half_dfb.wait() as half_blk:
+                    decision = ttl.math.sign(out_blk + out_blk - threshold_blk)
+                    out_blk.store(ttl.math.sign(decision - half_blk))
+
+            with spin_dfb.wait() as spin_blk:
+                with (
+                    categorical_weights_dfb.wait() as weights_blk,
+                    categorical_bias_dfb.wait() as bias_blk,
+                    gumbel_dfb.wait() as gumbel_blk,
+                    score0_dfb.reserve() as score0_blk,
+                ):
+                    score0_blk.store(bias_blk + gumbel_blk + spin_blk * weights_blk)
+                with (
+                    categorical_weights_dfb.wait() as weights_blk,
+                    categorical_bias_dfb.wait() as bias_blk,
+                    gumbel_dfb.wait() as gumbel_blk,
+                    score1_dfb.reserve() as score1_blk,
+                ):
+                    score1_blk.store(bias_blk + gumbel_blk + spin_blk * weights_blk)
+                with (
+                    categorical_weights_dfb.wait() as weights_blk,
+                    categorical_bias_dfb.wait() as bias_blk,
+                    gumbel_dfb.wait() as gumbel_blk,
+                    score2_dfb.reserve() as score2_blk,
+                ):
+                    score2_blk.store(bias_blk + gumbel_blk + spin_blk * weights_blk)
+
+            with (
+                score0_dfb.wait() as score0,
+                score1_dfb.wait() as score1,
+                score2_dfb.wait() as score2,
+                one_dfb.wait() as one_blk,
+                categorical_half_dfb.wait() as half_blk,
+            ):
+                gt01 = (ttl.math.sign(score0 - score1) + one_blk) * half_blk
+                gt02 = (ttl.math.sign(score0 - score2) + one_blk) * half_blk
+                with categorical_out_dfb.reserve() as out_blk:
+                    out_blk.store(gt01 * gt02)
+
+                gt10 = (ttl.math.sign(score1 - score0) + one_blk) * half_blk
+                gt12 = (ttl.math.sign(score1 - score2) + one_blk) * half_blk
+                with categorical_out_dfb.reserve() as out_blk:
+                    out_blk.store(gt10 * gt12)
+
+                gt20 = (ttl.math.sign(score2 - score0) + one_blk) * half_blk
+                gt21 = (ttl.math.sign(score2 - score1) + one_blk) * half_blk
+                with categorical_out_dfb.reserve() as out_blk:
+                    out_blk.store(gt20 * gt21)
+
+        @ttl.datamovement()
+        def read():
+            node_index, _node_row = ttl.node(dims=2)
+            lane_start = node_index * 5
+            weight_start = node_index * 3
+            threshold_index = threshold_base + node_index
+            gumbel_start = gumbel_base + node_index * 3
+
+            with spin_bias_dfb.reserve() as bias_blk:
+                tx_bias = ttl.copy(spin_bias[node_index, 0], bias_blk)
+                tx_bias.wait()
+            for category in range(3):
+                with cat_state_dfb.reserve() as cat_state_blk, spin_weights_dfb.reserve() as weights_blk:
+                    tx_state = ttl.copy(state[lane_start + 1 + category, 0], cat_state_blk)
+                    tx_weights = ttl.copy(spin_weights[weight_start + category, 0], weights_blk)
+                    tx_state.wait()
+                    tx_weights.wait()
+            with threshold_dfb.reserve() as threshold_blk:
+                tx_threshold = ttl.copy(threshold_logits[threshold_index, 0], threshold_blk)
+                tx_threshold.wait()
+            with spin_half_dfb.reserve() as half_blk:
+                tx_half = ttl.copy(half[0, 0], half_blk)
+                tx_half.wait()
+
+            with spin_dfb.reserve() as spin_blk:
+                tx_spin = ttl.copy(state[lane_start, 0], spin_blk)
+                tx_spin.wait()
+            for category in range(3):
+                with categorical_weights_dfb.reserve() as weights_blk:
+                    tx_weights = ttl.copy(categorical_weights[weight_start + category, 0], weights_blk)
+                    tx_weights.wait()
+                with categorical_bias_dfb.reserve() as bias_blk:
+                    tx_bias = ttl.copy(categorical_bias[weight_start + category, 0], bias_blk)
+                    tx_bias.wait()
+                with gumbel_dfb.reserve() as gumbel_blk:
+                    tx_gumbel = ttl.copy(gumbel[gumbel_start + category, 0], gumbel_blk)
+                    tx_gumbel.wait()
+            with one_dfb.reserve() as one_blk:
+                tx_one = ttl.copy(one[0, 0], one_blk)
+                tx_one.wait()
+            with categorical_half_dfb.reserve() as half_blk:
+                tx_half = ttl.copy(half[0, 0], half_blk)
+                tx_half.wait()
+
+        @ttl.datamovement()
+        def write():
+            node_index, _node_row = ttl.node(dims=2)
+            lane_start = node_index * 5
+            with spin_out_dfb.wait() as out_blk:
+                tx_out = ttl.copy(out_blk, out[lane_start, 0])
+                tx_out.wait()
+            for category in range(3):
+                with categorical_out_dfb.wait() as out_blk:
+                    tx_out = ttl.copy(out_blk, out[lane_start + 1 + category, 0])
+                    tx_out.wait()
+
+    return fused_group_update

@@ -57,8 +57,8 @@ def main() -> None:
     executor = ExperimentalTTLangExecutor(make_mixed_spin_categorical_gaussian_program())
     initial_lanes = executor.encode_state(_initial_state())
     sweep_kwargs = {
-        "spin_threshold_logits": {0: 0.0, 3: 0.0},
-        "categorical_gumbel": {1: (0.0, 0.0, 0.0), 4: (0.0, 0.0, 0.0)},
+        "spin_threshold_logits": {0: -0.1, 3: 0.2},
+        "categorical_gumbel": {1: (0.0, 2.0, 0.0), 4: (0.0, 0.0, 1.0)},
     }
     expected_lanes = executor.evaluate_discrete_sweep(
         initial_lanes,
@@ -74,6 +74,7 @@ def main() -> None:
             executor=executor,
         )
         runtime.upload_state(initial_lanes)
+        runtime.set_sweep_randomness(**sweep_kwargs)
         runtime.run_sweep()
 
         result = runtime.materialize_state()

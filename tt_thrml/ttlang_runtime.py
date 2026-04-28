@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 import numpy as np
@@ -17,6 +18,8 @@ ttl: Any = None
 _SUPPORTED_SAMPLING_ORDER = ((0, 1, 2), (3, 4, 5))
 _SUPPORTED_SPIN_BLOCKS = (0, 3)
 _SUPPORTED_CATEGORICAL_BLOCKS = (1, 4)
+_SPIN_THRESHOLD_CONSTANTS = {0: "threshold0", 3: "threshold1"}
+_CATEGORICAL_GUMBEL_CONSTANTS = {1: "gumbel0", 4: "gumbel1"}
 
 
 def tile_planes(values: list[float]) -> Any:
@@ -106,6 +109,36 @@ class TTLangDiscreteSweepRuntime:
             torch.zeros((self.executor.layout.total_lanes * TILE, TILE), dtype=torch.bfloat16)
         )
 
+    def set_sweep_randomness(
+        self,
+        *,
+        spin_threshold_logits: Mapping[int, float] | None = None,
+        categorical_gumbel: Mapping[int, Sequence[float]] | None = None,
+    ) -> None:
+        """Upload deterministic per-block random inputs for the next sweeps."""
+        torch = _torch()
+        spin_threshold_logits = spin_threshold_logits or {}
+        categorical_gumbel = categorical_gumbel or {}
+
+        unsupported_spin_blocks = set(spin_threshold_logits) - set(_SPIN_THRESHOLD_CONSTANTS)
+        if unsupported_spin_blocks:
+            raise ValueError(f"unsupported TT-Lang spin threshold blocks: {tuple(sorted(unsupported_spin_blocks))}")
+        unsupported_categorical_blocks = set(categorical_gumbel) - set(_CATEGORICAL_GUMBEL_CONSTANTS)
+        if unsupported_categorical_blocks:
+            raise ValueError(
+                f"unsupported TT-Lang categorical gumbel blocks: {tuple(sorted(unsupported_categorical_blocks))}"
+            )
+
+        for block_index, key in _SPIN_THRESHOLD_CONSTANTS.items():
+            value = float(spin_threshold_logits.get(block_index, 0.0))
+            self.constants[key] = self.from_torch(torch.full((TILE, TILE), value, dtype=torch.bfloat16))
+
+        for block_index, key in _CATEGORICAL_GUMBEL_CONSTANTS.items():
+            values = tuple(float(v) for v in categorical_gumbel.get(block_index, (0.0, 0.0, 0.0)))
+            if len(values) != N_CATEGORIES:
+                raise ValueError(f"TT-Lang categorical gumbel block {block_index} expects {N_CATEGORIES} values")
+            self.constants[key] = self.from_torch(tile_planes(list(values)))
+
     def run_sweep(self) -> None:
         current, mid, next_state = self._require_state()
         self._run_discrete_sweep(current, mid, next_state)
@@ -140,7 +173,8 @@ class TTLangDiscreteSweepRuntime:
         return {
             "one": self.from_torch(torch.ones((TILE, TILE), dtype=torch.bfloat16)),
             "half": self.from_torch(torch.full((TILE, TILE), 0.5, dtype=torch.bfloat16)),
-            "threshold": self.from_torch(torch.zeros((TILE, TILE), dtype=torch.bfloat16)),
+            "threshold0": self.from_torch(torch.zeros((TILE, TILE), dtype=torch.bfloat16)),
+            "threshold1": self.from_torch(torch.zeros((TILE, TILE), dtype=torch.bfloat16)),
             "gumbel0": self.from_torch(torch.zeros((N_CATEGORIES * TILE, TILE), dtype=torch.bfloat16)),
             "gumbel1": self.from_torch(torch.zeros((N_CATEGORIES * TILE, TILE), dtype=torch.bfloat16)),
             "spin0_weights": self.from_torch(tile_planes(list(spin_plans[0].categorical_weights[0]))),
@@ -161,7 +195,7 @@ class TTLangDiscreteSweepRuntime:
             state_in,
             constants["spin0_weights"],
             constants["spin0_bias"],
-            constants["threshold"],
+            constants["threshold0"],
             constants["half"],
             state_mid,
         )
@@ -180,7 +214,7 @@ class TTLangDiscreteSweepRuntime:
             state_mid,
             constants["spin1_weights"],
             constants["spin1_bias"],
-            constants["threshold"],
+            constants["threshold1"],
             constants["half"],
             state_out,
         )

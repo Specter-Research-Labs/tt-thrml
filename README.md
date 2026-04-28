@@ -87,12 +87,13 @@ j-quietbox-ttlang-discrete-runtime-bench-50-idogfw
 j-quietbox-ttlang-discrete-runtime-current-state-bench-idy121
 j-quietbox-ttlang-discrete-runtime-final-state-bench-ie1v9y
 j-quietbox-ttlang-discrete-runtime-support-boundary-bench-iere11
+j-quietbox-ttlang-discrete-runtime-randomness-bench-ieu9sz
 ```
 
-The latest final-state-checked 50-sweep TT-Lang benchmark measured 32.25 ms
-total, or 0.645
-ms/sweep, for the current narrow implementation. It still uses six dispatches
-per sweep, so this is a baseline before fusing group copy/update work.
+The latest final-state-checked nonzero-randomness 50-sweep TT-Lang benchmark
+measured 32.15 ms total, or 0.643 ms/sweep, for the current narrow
+implementation. It still uses six dispatches per sweep, so this is a baseline
+before fusing group copy/update work.
 
 The current TT-MLIR/TTRT demo profile is not the same narrow workload, but it
 shows the overhead we are trying to escape: the mixed demo reported mean

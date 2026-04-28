@@ -113,10 +113,12 @@ same QuietBox benchmark shape. The earlier 6-dispatch runtime measured
 ## TT-Lang Reproducer
 
 [`reproducers/ttlang_simultaneous_carry_hang.py`](reproducers/ttlang_simultaneous_carry_hang.py)
-captures the smallest current blocker for a whole-window recurrent TT-Lang
-kernel: a simulator-clean, hardware-hanging simultaneous carried-CB pattern.
-Until that upstream issue is resolved, the production runtime keeps the
-hardware-clean fused one-sweep path.
+captures a minimal simulator-clean, hardware-hanging simultaneous carried-CB
+pattern.
+[`reproducers/ttlang_coupled_recurrent_hang.py`](reproducers/ttlang_coupled_recurrent_hang.py)
+captures the THRML-shaped blocker: a sequential carried spin/category recurrent
+window that still hangs on hardware. Until that upstream issue is resolved, the
+production runtime keeps the hardware-clean fused one-sweep path.
 
 ## Randomness
 

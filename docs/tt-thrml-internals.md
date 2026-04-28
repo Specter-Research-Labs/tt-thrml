@@ -85,10 +85,12 @@ The key derivation matches THRML's one-sweep sampling path:
 For TT-Lang, Bernoulli draws are represented as logit thresholds and categorical
 draws are represented as Gumbel-max perturbations. The current runtime selects
 window rows with cached TT-Lang operations. A whole-window recurrent kernel is
-blocked on a TT-Lang hardware hang captured in
-`reproducers/ttlang_simultaneous_carry_hang.py`: the simulator accepts multiple
-carried dataflow-buffer fronts held live while the next fronts are pushed, but
-Wormhole hardware hangs. The sequential carry pattern is hardware-clean.
+blocked on TT-Lang hardware hangs captured in `reproducers/`:
+`ttlang_simultaneous_carry_hang.py` minimizes the simultaneous carried-CB
+failure, and `ttlang_coupled_recurrent_hang.py` shows the THRML-shaped
+spin/category loop still hanging even after the carried state schedule is made
+sequential. The simpler arithmetic-only sequential carry pattern is
+hardware-clean.
 
 ## Device Ownership
 

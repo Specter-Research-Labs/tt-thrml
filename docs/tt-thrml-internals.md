@@ -89,8 +89,9 @@ blocked on TT-Lang hardware hangs captured in `reproducers/`:
 `ttlang_simultaneous_carry_hang.py` minimizes the simultaneous carried-CB
 failure, and `ttlang_coupled_recurrent_hang.py` shows the THRML-shaped
 spin/category loop still hanging even after the carried state schedule is made
-sequential. The simpler arithmetic-only sequential carry pattern is
-hardware-clean.
+sequential. `ttlang_categorical_recurrent_hang.py` reduces the THRML-shaped
+failure to categorical recurrent writeback alone. The simpler arithmetic-only
+sequential carry pattern is hardware-clean.
 
 ## Device Ownership
 

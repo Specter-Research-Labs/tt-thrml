@@ -117,8 +117,11 @@ captures a minimal simulator-clean, hardware-hanging simultaneous carried-CB
 pattern.
 [`reproducers/ttlang_coupled_recurrent_hang.py`](reproducers/ttlang_coupled_recurrent_hang.py)
 captures the THRML-shaped blocker: a sequential carried spin/category recurrent
-window that still hangs on hardware. Until that upstream issue is resolved, the
-production runtime keeps the hardware-clean fused one-sweep path.
+window that still hangs on hardware.
+[`reproducers/ttlang_categorical_recurrent_hang.py`](reproducers/ttlang_categorical_recurrent_hang.py)
+reduces that to categorical recurrent writeback alone. Until that upstream issue
+is resolved, the production runtime keeps the hardware-clean fused one-sweep
+path.
 
 ## Randomness
 

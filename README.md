@@ -30,9 +30,9 @@ The current hardware-proven path supports the mixed discrete smoke shape:
 
 - spin target from one-hot categorical source lanes
 - categorical target from signed spin source lanes
-- two Gibbs sampling groups
+- two or more independent Gibbs sampling groups
 - device-resident 10-lane TT-Lang state across sweeps
-- two TT-Lang dispatches per sweep
+- one TT-Lang dispatch per sweep for regular independent groups
 
 Host-facing THRML state remains booleans, category ids, and floats. Device state
 is lowered into TT-Lang lanes:
@@ -95,19 +95,28 @@ podman run -d --privileged --network host --name tt-lang-codex \
 ## Latest Hardware Check
 
 Current cleanup HEAD passed on QuietBox for both the original two-group shape
-and a three-group generalized shape:
+and a three-group generalized shape. Both shapes now fuse regular independent
+groups into one dispatch per sweep:
 
 ```text
-j-quietbox-ttlang-generic-default-smoke-iuahj8
-0.410 ms/sweep, 2 dispatches/sweep
+default mixed discrete shape
+0.274 ms/sweep, 1 dispatch/sweep
 
-j-quietbox-ttlang-generic-three-group-smoke-iudl1t
-1.027 ms/sweep, 3 dispatches/sweep
+three independent group shape
+0.422 ms/sweep, 1 dispatch/sweep
 ```
 
-The earlier steady two-group benchmark measured 0.390 ms/sweep. The prior
-6-dispatch runtime measured 0.699 ms/sweep on the same QuietBox benchmark
-shape.
+The prior two-dispatch grouped runtime measured about 0.390 ms/sweep on the
+same QuietBox benchmark shape. The earlier 6-dispatch runtime measured
+0.699 ms/sweep.
+
+## TT-Lang Reproducer
+
+[`reproducers/ttlang_simultaneous_carry_hang.py`](reproducers/ttlang_simultaneous_carry_hang.py)
+captures the smallest current blocker for a whole-window recurrent TT-Lang
+kernel: a simulator-clean, hardware-hanging simultaneous carried-CB pattern.
+Until that upstream issue is resolved, the production runtime keeps the
+hardware-clean fused one-sweep path.
 
 ## Randomness
 

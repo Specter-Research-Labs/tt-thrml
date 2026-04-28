@@ -39,7 +39,8 @@ The current hardware-proven planner accepts:
 
 - one-node spin targets with categorical sources
 - one-node categorical targets with spin sources
-- two Gibbs groups, each containing one spin update and one categorical update
+- independent Gibbs groups, each containing one spin update and one categorical
+  update
 
 Unsupported shapes raise during planning or runtime validation.
 
@@ -48,13 +49,13 @@ Unsupported shapes raise during planning or runtime validation.
 `TTLangDiscreteSweepRuntime` owns one device-resident state buffer and TT-Lang
 operations. One sweep currently runs:
 
-1. run one TT-Lang operation for the first Gibbs group
-2. run one TT-Lang operation for the second Gibbs group
+1. run one fused TT-Lang operation for regular independent Gibbs groups
+2. otherwise, run one TT-Lang operation per independent group
 
 Each group operation reads its pre-group state values and writes only the
 group's updated spin and categorical lanes back into the state buffer. Later
-groups may not read lanes written by earlier groups. That is two TT-Lang
-dispatches per sweep.
+groups may not read lanes written by earlier groups. Regular independent groups
+fuse into one TT-Lang dispatch per sweep.
 
 Hardware note: bad fused-kernel experiments can leave Wormhole dispatch cores
 running after the host process is killed. If TT-Metal reports unexpected
@@ -83,9 +84,11 @@ The key derivation matches THRML's one-sweep sampling path:
 
 For TT-Lang, Bernoulli draws are represented as logit thresholds and categorical
 draws are represented as Gumbel-max perturbations. The current runtime selects
-window rows with cached TT-Lang operations; the next optimization is to consume
-an entire sweep window inside one group kernel so a long chain does not need one
-host dispatch per sweep.
+window rows with cached TT-Lang operations. A whole-window recurrent kernel is
+blocked on a TT-Lang hardware hang captured in
+`reproducers/ttlang_simultaneous_carry_hang.py`: the simulator accepts multiple
+carried dataflow-buffer fronts held live while the next fronts are pushed, but
+Wormhole hardware hangs. The sequential carry pattern is hardware-clean.
 
 ## Device Ownership
 

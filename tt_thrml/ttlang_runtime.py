@@ -46,6 +46,7 @@ def validate_ttlang_discrete_runtime(executor: "TTLangProgramPlanner") -> None:
             raise ValueError(f"unsupported TT-Lang categorical plan shape for block {block_index}")
 
     planned_blocks = set(spin_plans) | set(categorical_plans)
+    prior_writes: set[int] = set()
     for group in runtime_groups:
         if group.spin_block is None or group.categorical_block is None:
             raise ValueError(f"TT-Lang runtime expects one spin and one categorical update per group: {group}")
@@ -53,6 +54,10 @@ def validate_ttlang_discrete_runtime(executor: "TTLangProgramPlanner") -> None:
         unexpected_group_blocks = set(group.block_indices) & planned_blocks - supported_group_blocks
         if unexpected_group_blocks:
             raise ValueError(f"unsupported TT-Lang grouped plan blocks: {tuple(sorted(unexpected_group_blocks))}")
+        group_reads = _group_read_lanes(group, spin_plans, categorical_plans)
+        if group_reads & prior_writes:
+            raise ValueError("TT-Lang in-place runtime only supports independent sampling groups")
+        prior_writes |= _group_write_lanes(group, spin_plans, categorical_plans)
 
 
 def supports_ttlang_discrete_runtime(program: BlockSamplingProgram) -> bool:
@@ -96,8 +101,8 @@ class TTLangDiscreteSweepRuntime:
     """Device-resident executor for the current supported TT-Lang sweep shape.
 
     This class intentionally wraps only the hardware-proven path: each sampling
-    group reads the pre-group state snapshot, preserves untouched lanes, and
-    computes one spin plus one categorical update.
+    group updates its spin and categorical lanes in-place, and later groups may
+    not read lanes written by earlier groups.
     """
 
     dispatches_per_sweep = 2
@@ -117,22 +122,12 @@ class TTLangDiscreteSweepRuntime:
             spin_plans,
             categorical_plans,
             groups=self.groups,
-            total_lanes=executor.layout.total_lanes,
         )
         self.constants = self._make_constants(spin_plans, categorical_plans)
         self._state_current: Any | None = None
-        self._state_mid: Any | None = None
-        self._state_next: Any | None = None
 
     def upload_state(self, lanes: Any) -> None:
-        torch = _torch()
         self._state_current = self.from_torch(state_tiles(lanes))
-        self._state_mid = self.from_torch(
-            torch.zeros((self.executor.layout.total_lanes * TILE, TILE), dtype=torch.bfloat16)
-        )
-        self._state_next = self.from_torch(
-            torch.zeros((self.executor.layout.total_lanes * TILE, TILE), dtype=torch.bfloat16)
-        )
 
     def load_state(self, state_free: Sequence[Any], state_clamp: Sequence[Any] = ()) -> None:
         self.upload_state(self.executor.encode_state(list(state_free) + list(state_clamp)))
@@ -181,9 +176,8 @@ class TTLangDiscreteSweepRuntime:
         )
 
     def run_sweep(self) -> None:
-        current, mid, next_state = self._require_state()
-        self._run_discrete_sweep(current, mid, next_state)
-        self._state_current, self._state_next = next_state, current
+        current = self._require_state()
+        self._run_discrete_sweep(current)
 
     def run_sweeps(self, n_sweeps: int) -> float:
         if n_sweeps <= 0:
@@ -197,7 +191,7 @@ class TTLangDiscreteSweepRuntime:
         return (time.perf_counter() - t0) * 1000.0
 
     def materialize_state(self) -> Any:
-        current, _, _ = self._require_state()
+        current = self._require_state()
         return self.ttnn.to_torch(current).to(_torch().bfloat16)
 
     def read_state_lists(self) -> tuple[list[Any], list[Any]]:
@@ -244,17 +238,14 @@ class TTLangDiscreteSweepRuntime:
             constants[_categorical_key(block_index, "bias")] = self.from_torch(tile_planes(list(plan.bias)))
         return constants
 
-    def _run_discrete_sweep(self, state_in: Any, state_mid: Any, state_out: Any) -> None:
+    def _run_discrete_sweep(self, state: Any) -> None:
         ops = self.operations
         constants = self.constants
-        state_buffers = (state_in, state_mid, state_out)
         for group_index, group in enumerate(self.groups):
-            group_in = state_buffers[group_index]
-            group_out = state_buffers[group_index + 1]
             spin_block = _require_block(group.spin_block, "spin", group)
             categorical_block = _require_block(group.categorical_block, "categorical", group)
             ops.group_updates[group_index](
-                group_in,
+                state,
                 constants[_spin_key(spin_block, "weights")],
                 constants[_spin_key(spin_block, "bias")],
                 constants[_spin_key(spin_block, "threshold")],
@@ -263,13 +254,13 @@ class TTLangDiscreteSweepRuntime:
                 constants[_categorical_key(categorical_block, "gumbel")],
                 constants["one"],
                 constants["half"],
-                group_out,
+                state,
             )
 
-    def _require_state(self) -> tuple[Any, Any, Any]:
-        if self._state_current is None or self._state_mid is None or self._state_next is None:
+    def _require_state(self) -> Any:
+        if self._state_current is None:
             raise RuntimeError("state must be uploaded before running TT-Lang sweeps")
-        return self._state_current, self._state_mid, self._state_next
+        return self._state_current
 
 
 def _torch() -> Any:
@@ -323,20 +314,30 @@ def _require_block(block_index: int | None, family: str, group: _RuntimeGroup) -
     return block_index
 
 
+def _group_read_lanes(group: _RuntimeGroup, spin_plans: dict[int, Any], categorical_plans: dict[int, Any]) -> set[int]:
+    spin_plan = spin_plans[_require_block(group.spin_block, "spin", group)]
+    categorical_plan = categorical_plans[_require_block(group.categorical_block, "categorical", group)]
+    return set(spin_plan.categorical_lane_groups[0]) | set(categorical_plan.spin_lanes)
+
+
+def _group_write_lanes(group: _RuntimeGroup, spin_plans: dict[int, Any], categorical_plans: dict[int, Any]) -> set[int]:
+    spin_plan = spin_plans[_require_block(group.spin_block, "spin", group)]
+    categorical_plan = categorical_plans[_require_block(group.categorical_block, "categorical", group)]
+    return {spin_plan.output_lane} | set(categorical_plan.output_lanes)
+
+
 def _define_operations(
     ttl_module: Any,
     spin_plans: dict[int, Any],
     categorical_plans: dict[int, Any],
     *,
     groups: tuple[_RuntimeGroup, ...],
-    total_lanes: int,
 ) -> _Operations:
     global ttl
     ttl = ttl_module
 
     def define_group_update(
         *,
-        n_lanes: int,
         spin_source_start: int,
         spin_output_lane: int,
         categorical_source_lane: int,
@@ -355,7 +356,6 @@ def _define_operations(
             half,
             out,
         ):
-            copy_dfb = ttl.make_dataflow_buffer_like(state, shape=(1, 1), block_count=n_lanes)
             cat_state_dfb = ttl.make_dataflow_buffer_like(state, shape=(1, 1), block_count=2)
             spin_weights_dfb = ttl.make_dataflow_buffer_like(spin_weights, shape=(1, 1), block_count=2)
             spin_bias_dfb = ttl.make_dataflow_buffer_like(spin_bias, shape=(1, 1), block_count=2)
@@ -432,14 +432,6 @@ def _define_operations(
 
             @ttl.datamovement()
             def read():
-                for lane in range(n_lanes):
-                    if lane != spin_output_lane and (
-                        lane < categorical_output_start or lane >= categorical_output_start + N_CATEGORIES
-                    ):
-                        with copy_dfb.reserve() as copy_blk:
-                            tx_copy = ttl.copy(state[lane, 0], copy_blk)
-                            tx_copy.wait()
-
                 with spin_bias_dfb.reserve() as bias_blk:
                     tx_bias = ttl.copy(spin_bias[0, 0], bias_blk)
                     tx_bias.wait()
@@ -478,13 +470,6 @@ def _define_operations(
 
             @ttl.datamovement()
             def write():
-                for lane in range(n_lanes):
-                    if lane != spin_output_lane and (
-                        lane < categorical_output_start or lane >= categorical_output_start + N_CATEGORIES
-                    ):
-                        with copy_dfb.wait() as copy_blk:
-                            tx_copy = ttl.copy(copy_blk, out[lane, 0])
-                            tx_copy.wait()
                 with spin_out_dfb.wait() as out_blk:
                     tx_out = ttl.copy(out_blk, out[spin_output_lane, 0])
                     tx_out.wait()
@@ -498,7 +483,6 @@ def _define_operations(
     return _Operations(
         group_updates=tuple(
             define_group_update(
-                n_lanes=total_lanes,
                 spin_source_start=spin_plans[_require_block(group.spin_block, "spin", group)].categorical_lane_groups[
                     0
                 ][0],

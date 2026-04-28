@@ -45,15 +45,16 @@ Unsupported shapes raise during planning or runtime validation.
 
 ## Runtime
 
-`TTLangDiscreteSweepRuntime` owns device-resident state buffers and TT-Lang
+`TTLangDiscreteSweepRuntime` owns one device-resident state buffer and TT-Lang
 operations. One sweep currently runs:
 
 1. run one TT-Lang operation for the first Gibbs group
 2. run one TT-Lang operation for the second Gibbs group
 
-Each group operation reads the pre-group state snapshot, copies preserved lanes
-to the output buffer, and computes the group's spin and categorical updates.
-That is two TT-Lang dispatches per sweep.
+Each group operation reads its pre-group state values and writes only the
+group's updated spin and categorical lanes back into the state buffer. Later
+groups may not read lanes written by earlier groups. That is two TT-Lang
+dispatches per sweep.
 
 Hardware note: bad fused-kernel experiments can leave Wormhole dispatch cores
 running after the host process is killed. If TT-Metal reports unexpected

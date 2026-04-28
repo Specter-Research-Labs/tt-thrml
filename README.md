@@ -98,14 +98,15 @@ podman run -d --privileged --network host --name tt-lang-codex \
 Current cleanup HEAD passed on QuietBox:
 
 ```text
-j-quietbox-ttlang-fused-group-bench-inv8is
+j-quietbox-ttlang-inplace-group-bench-iqvgem
 PASS: TT-Lang THRML discrete sweep
 2 warmup sweeps, 10 measured sweeps
-3.51 ms total, 0.351 ms/sweep, 2 dispatches/sweep
+3.47 ms total, 0.347 ms/sweep, 2 dispatches/sweep
 ```
 
-The prior 6-dispatch runtime measured 6.99 ms total, 0.699 ms/sweep on the
-same 2-warmup/10-measured QuietBox benchmark.
+The prior copy-based 2-dispatch runtime measured 3.51 ms total,
+0.351 ms/sweep. The prior 6-dispatch runtime measured 6.99 ms total,
+0.699 ms/sweep on the same 2-warmup/10-measured QuietBox benchmark.
 
 ## Randomness
 

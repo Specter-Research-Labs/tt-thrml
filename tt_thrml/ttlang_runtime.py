@@ -272,7 +272,7 @@ class TTLangDiscreteSweepRuntime:
 
 
 def _torch() -> Any:
-    import torch  # type: ignore[reportMissingImports]
+    import torch
 
     return torch
 

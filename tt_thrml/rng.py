@@ -41,7 +41,7 @@ def make_rng_spec(blocks: tuple, n_sweeps: int) -> RNGSpec:
 
 
 def _upload(ttnn, device, arr: np.ndarray, state_dtype, layout) -> object:
-    import torch  # type: ignore[reportMissingImports]
+    import torch
 
     tensor = torch.from_numpy(arr.astype(np.float32).copy()).contiguous()
     return ttnn.from_torch(tensor, dtype=state_dtype, layout=layout, device=device)

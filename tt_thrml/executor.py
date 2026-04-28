@@ -113,7 +113,7 @@ class Executor:
         if len(block_arrays) != len(self.compiled.blocks):
             raise ValueError(f"Expected {len(self.compiled.blocks)} block states, got {len(block_arrays)}")
 
-        import torch  # type: ignore[reportMissingImports]
+        import torch
 
         global_arr = np.concatenate(block_arrays).astype(np.float32)
         tensor = torch.from_numpy(global_arr.copy()).contiguous()

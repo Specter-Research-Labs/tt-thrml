@@ -6,7 +6,7 @@ import time
 from typing import Any
 
 import numpy as np
-import torch  # type: ignore[reportMissingImports]
+from thrml.block_sampling import BlockSamplingProgram
 
 from .ttlang_backend import ExperimentalTTLangExecutor
 
@@ -14,14 +14,60 @@ TILE = 32
 N_CATEGORIES = 3
 ttl: Any = None
 
+_SUPPORTED_SAMPLING_ORDER = ((0, 1, 2), (3, 4, 5))
+_SUPPORTED_SPIN_BLOCKS = (0, 3)
+_SUPPORTED_CATEGORICAL_BLOCKS = (1, 4)
 
-def tile_planes(values: list[float]) -> torch.Tensor:
+
+def tile_planes(values: list[float]) -> Any:
+    torch = _torch()
     planes = np.asarray(values, dtype=np.float32)[:, None, None] * np.ones((len(values), TILE, TILE), dtype=np.float32)
     return torch.from_numpy(planes.reshape(len(values) * TILE, TILE)).to(torch.bfloat16)
 
 
-def state_tiles(lanes: np.ndarray) -> torch.Tensor:
+def state_tiles(lanes: np.ndarray) -> Any:
     return tile_planes([float(value) for value in lanes])
+
+
+def validate_ttlang_discrete_runtime(executor: ExperimentalTTLangExecutor) -> None:
+    """Validate the narrow program shape currently backed by hardware kernels."""
+    if executor.layout.total_lanes != 10:
+        raise ValueError(f"TT-Lang discrete runtime expects 10 lanes, got {executor.layout.total_lanes}")
+    if executor.sampling_order != _SUPPORTED_SAMPLING_ORDER:
+        raise ValueError(f"unsupported TT-Lang sampling order: {executor.sampling_order}")
+
+    spin_plans = {plan.block_index: plan for plan in executor.spin_categorical_plans}
+    categorical_plans = {plan.block_index: plan for plan in executor.categorical_spin_plans}
+    if tuple(sorted(spin_plans)) != _SUPPORTED_SPIN_BLOCKS:
+        raise ValueError(f"unsupported TT-Lang spin plan blocks: {tuple(sorted(spin_plans))}")
+    if tuple(sorted(categorical_plans)) != _SUPPORTED_CATEGORICAL_BLOCKS:
+        raise ValueError(f"unsupported TT-Lang categorical plan blocks: {tuple(sorted(categorical_plans))}")
+
+    expected_spin_lanes = {0: 0, 3: 5}
+    expected_categorical_lanes = {1: (1, 2, 3), 4: (6, 7, 8)}
+    for block_index, output_lane in expected_spin_lanes.items():
+        plan = spin_plans[block_index]
+        if plan.output_lane != output_lane or plan.n_categorical_terms != 1:
+            raise ValueError(f"unsupported TT-Lang spin plan shape for block {block_index}")
+    for block_index, output_lanes in expected_categorical_lanes.items():
+        plan = categorical_plans[block_index]
+        if plan.output_lanes != output_lanes or len(plan.spin_lanes) != 1 or plan.n_categories != N_CATEGORIES:
+            raise ValueError(f"unsupported TT-Lang categorical plan shape for block {block_index}")
+
+
+def supports_ttlang_discrete_runtime(program: BlockSamplingProgram) -> bool:
+    try:
+        validate_ttlang_discrete_runtime(ExperimentalTTLangExecutor(program))
+    except ValueError:
+        return False
+    return True
+
+
+def make_ttlang_discrete_runtime(
+    *, ttl: Any, ttnn: Any, device: Any, executor: ExperimentalTTLangExecutor
+) -> "TTLangDiscreteSweepRuntime":
+    validate_ttlang_discrete_runtime(executor)
+    return TTLangDiscreteSweepRuntime(ttl=ttl, ttnn=ttnn, device=device, executor=executor)
 
 
 class TTLangDiscreteSweepRuntime:
@@ -36,6 +82,7 @@ class TTLangDiscreteSweepRuntime:
     dispatches_per_sweep = 6
 
     def __init__(self, *, ttl: Any, ttnn: Any, device: Any, executor: ExperimentalTTLangExecutor):
+        validate_ttlang_discrete_runtime(executor)
         self.ttl = ttl
         self.ttnn = ttnn
         self.device = device
@@ -50,6 +97,7 @@ class TTLangDiscreteSweepRuntime:
         self._state_next: Any | None = None
 
     def upload_state(self, lanes: np.ndarray) -> None:
+        torch = _torch()
         self._state_current = self.from_torch(state_tiles(lanes))
         self._state_mid = self.from_torch(
             torch.zeros((self.executor.layout.total_lanes * TILE, TILE), dtype=torch.bfloat16)
@@ -74,11 +122,11 @@ class TTLangDiscreteSweepRuntime:
         self.ttnn.synchronize_device(self.device)
         return (time.perf_counter() - t0) * 1000.0
 
-    def materialize_state(self) -> torch.Tensor:
+    def materialize_state(self) -> Any:
         current, _, _ = self._require_state()
-        return self.ttnn.to_torch(current).to(torch.bfloat16)
+        return self.ttnn.to_torch(current).to(_torch().bfloat16)
 
-    def from_torch(self, tensor: torch.Tensor):
+    def from_torch(self, tensor: Any):
         return self.ttnn.from_torch(
             tensor,
             dtype=self.ttnn.bfloat16,
@@ -88,6 +136,7 @@ class TTLangDiscreteSweepRuntime:
         )
 
     def _make_constants(self, spin_plans: dict[int, Any], categorical_plans: dict[int, Any]) -> dict[str, Any]:
+        torch = _torch()
         return {
             "one": self.from_torch(torch.ones((TILE, TILE), dtype=torch.bfloat16)),
             "half": self.from_torch(torch.full((TILE, TILE), 0.5, dtype=torch.bfloat16)),
@@ -149,6 +198,12 @@ class TTLangDiscreteSweepRuntime:
         if self._state_current is None or self._state_mid is None or self._state_next is None:
             raise RuntimeError("state must be uploaded before running TT-Lang sweeps")
         return self._state_current, self._state_mid, self._state_next
+
+
+def _torch() -> Any:
+    import torch  # type: ignore[reportMissingImports]
+
+    return torch
 
 
 class _Operations:

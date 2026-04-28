@@ -26,6 +26,12 @@ from .core import (
 from .executor import Executor, make_executor
 from .mesh import MeshExecutor, make_mesh_executor, mesh_barrier, mesh_device_ids, mesh_size
 from .rng import generate_bulk_rng, make_rng_spec, slice_rng_for_sweep
+from .ttlang_runtime import (
+    TTLangDiscreteSweepRuntime,
+    make_ttlang_discrete_runtime,
+    supports_ttlang_discrete_runtime,
+    validate_ttlang_discrete_runtime,
+)
 
 
 def sample_states(
@@ -93,4 +99,8 @@ __all__ = [
     "sample_states",
     "sample_with_observation",
     "GaussianConditional",
+    "TTLangDiscreteSweepRuntime",
+    "make_ttlang_discrete_runtime",
+    "supports_ttlang_discrete_runtime",
+    "validate_ttlang_discrete_runtime",
 ]

@@ -14,7 +14,7 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from tt_thrml.example_programs import make_mixed_spin_categorical_gaussian_program
 from tt_thrml.ttlang_backend import ExperimentalTTLangExecutor
-from tt_thrml.ttlang_runtime import TTLangDiscreteSweepRuntime, state_tiles
+from tt_thrml.ttlang_runtime import make_ttlang_discrete_runtime, state_tiles
 
 
 def _require_ttlang():
@@ -67,7 +67,12 @@ def main() -> None:
 
     device = ttnn.open_device(device_id=0)
     try:
-        runtime = TTLangDiscreteSweepRuntime(ttl=ttl, ttnn=ttnn, device=device, executor=executor)
+        runtime = make_ttlang_discrete_runtime(
+            ttl=ttl,
+            ttnn=ttnn,
+            device=device,
+            executor=executor,
+        )
         runtime.upload_state(initial_lanes)
         runtime.run_sweep()
 

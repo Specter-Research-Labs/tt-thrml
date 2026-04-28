@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from tt_thrml.core import Family
 from tt_thrml.example_programs import make_mixed_spin_categorical_gaussian_program
@@ -17,6 +18,7 @@ from tt_thrml.ttlang_backend import (
     evaluate_spin_categorical_plan,
     expand_categorical_gather_lanes,
 )
+from tt_thrml.ttlang_runtime import supports_ttlang_discrete_runtime, validate_ttlang_discrete_runtime
 
 
 def test_ttlang_state_layout_expands_categorical_blocks_to_one_hot_lanes():
@@ -260,3 +262,15 @@ def test_experimental_ttlang_executor_evaluates_repeated_supported_discrete_swee
         executor.evaluate_discrete_sweeps(state_lanes, 0, **sweep_kwargs),
         state_lanes,
     )
+
+
+def test_ttlang_runtime_support_boundary_accepts_only_proven_discrete_shape():
+    program = make_mixed_spin_categorical_gaussian_program()
+    executor = ExperimentalTTLangExecutor(program)
+
+    assert supports_ttlang_discrete_runtime(program)
+    validate_ttlang_discrete_runtime(executor)
+
+    executor.sampling_order = ((0, 1, 2, 3, 4, 5),)
+    with pytest.raises(ValueError, match="sampling order"):
+        validate_ttlang_discrete_runtime(executor)

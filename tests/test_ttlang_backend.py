@@ -229,3 +229,34 @@ def test_experimental_ttlang_executor_evaluates_supported_discrete_sweep_by_grou
     assert decoded[3].tolist() == [True]
     assert decoded[4].tolist() == [0]
     np.testing.assert_allclose(decoded[5], [-0.75])
+
+
+def test_experimental_ttlang_executor_evaluates_repeated_supported_discrete_sweeps():
+    executor = ExperimentalTTLangExecutor(make_mixed_spin_categorical_gaussian_program())
+    state_lanes = executor.encode_state(
+        [
+            np.asarray([True]),
+            np.asarray([1], dtype=np.uint8),
+            np.asarray([0.25], dtype=np.float32),
+            np.asarray([False]),
+            np.asarray([1], dtype=np.uint8),
+            np.asarray([-0.75], dtype=np.float32),
+        ]
+    )
+
+    sweep_kwargs = {
+        "spin_threshold_logits": {0: 0.0, 3: 0.0},
+        "categorical_gumbel": {1: (0.0, 0.0, 0.0), 4: (0.0, 0.0, 0.0)},
+    }
+    expected = state_lanes
+    for _ in range(4):
+        expected = executor.evaluate_discrete_sweep(expected, **sweep_kwargs)
+
+    np.testing.assert_array_equal(
+        executor.evaluate_discrete_sweeps(state_lanes, 4, **sweep_kwargs),
+        expected,
+    )
+    np.testing.assert_array_equal(
+        executor.evaluate_discrete_sweeps(state_lanes, 0, **sweep_kwargs),
+        state_lanes,
+    )

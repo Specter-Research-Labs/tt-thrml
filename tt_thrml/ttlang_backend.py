@@ -227,6 +227,25 @@ class ExperimentalTTLangExecutor:
 
         return current
 
+    def evaluate_discrete_sweeps(
+        self,
+        state_lanes: np.ndarray,
+        n_sweeps: int,
+        *,
+        spin_threshold_logits: dict[int, float],
+        categorical_gumbel: dict[int, Sequence[float]],
+    ) -> np.ndarray:
+        if n_sweeps < 0:
+            raise ValueError("n_sweeps must be non-negative")
+        current = np.asarray(state_lanes, dtype=np.float32).reshape(-1).copy()
+        for _ in range(n_sweeps):
+            current = self.evaluate_discrete_sweep(
+                current,
+                spin_threshold_logits=spin_threshold_logits,
+                categorical_gumbel=categorical_gumbel,
+            )
+        return current
+
 
 def _as_spec(block_or_spec: CompiledFusedBlock | FusedBlockSpec) -> FusedBlockSpec:
     return block_or_spec.spec if isinstance(block_or_spec, CompiledFusedBlock) else block_or_spec

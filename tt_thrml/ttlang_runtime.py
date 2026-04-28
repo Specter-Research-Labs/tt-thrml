@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from thrml.block_sampling import BlockSamplingProgram
@@ -14,12 +15,6 @@ if TYPE_CHECKING:
 TILE = 32
 N_CATEGORIES = 3
 ttl: Any = None
-
-_SUPPORTED_SAMPLING_ORDER = ((0, 1, 2), (3, 4, 5))
-_SUPPORTED_SPIN_BLOCKS = (0, 3)
-_SUPPORTED_CATEGORICAL_BLOCKS = (1, 4)
-_SPIN_THRESHOLD_CONSTANTS = {0: "threshold0", 3: "threshold1"}
-_CATEGORICAL_GUMBEL_CONSTANTS = {1: "gumbel0", 4: "gumbel1"}
 
 
 def tile_planes(values: list[float]) -> Any:
@@ -36,26 +31,28 @@ def validate_ttlang_discrete_runtime(executor: "ExperimentalTTLangExecutor") -> 
     """Validate the narrow program shape currently backed by hardware kernels."""
     if executor.layout.total_lanes != 10:
         raise ValueError(f"TT-Lang discrete runtime expects 10 lanes, got {executor.layout.total_lanes}")
-    if executor.sampling_order != _SUPPORTED_SAMPLING_ORDER:
-        raise ValueError(f"unsupported TT-Lang sampling order: {executor.sampling_order}")
 
     spin_plans = {plan.block_index: plan for plan in executor.spin_categorical_plans}
     categorical_plans = {plan.block_index: plan for plan in executor.categorical_spin_plans}
-    if tuple(sorted(spin_plans)) != _SUPPORTED_SPIN_BLOCKS:
-        raise ValueError(f"unsupported TT-Lang spin plan blocks: {tuple(sorted(spin_plans))}")
-    if tuple(sorted(categorical_plans)) != _SUPPORTED_CATEGORICAL_BLOCKS:
-        raise ValueError(f"unsupported TT-Lang categorical plan blocks: {tuple(sorted(categorical_plans))}")
+    runtime_groups = _make_runtime_groups(executor, spin_plans, categorical_plans)
+    if len(runtime_groups) != 2:
+        raise ValueError(f"TT-Lang discrete runtime expects 2 sampling groups, got {len(runtime_groups)}")
 
-    expected_spin_lanes = {0: 0, 3: 5}
-    expected_categorical_lanes = {1: (1, 2, 3), 4: (6, 7, 8)}
-    for block_index, output_lane in expected_spin_lanes.items():
-        plan = spin_plans[block_index]
-        if plan.output_lane != output_lane or plan.n_categorical_terms != 1:
+    for block_index, plan in spin_plans.items():
+        if plan.n_categorical_terms != 1:
             raise ValueError(f"unsupported TT-Lang spin plan shape for block {block_index}")
-    for block_index, output_lanes in expected_categorical_lanes.items():
-        plan = categorical_plans[block_index]
-        if plan.output_lanes != output_lanes or len(plan.spin_lanes) != 1 or plan.n_categories != N_CATEGORIES:
+    for block_index, plan in categorical_plans.items():
+        if len(plan.spin_lanes) != 1 or plan.n_categories != N_CATEGORIES:
             raise ValueError(f"unsupported TT-Lang categorical plan shape for block {block_index}")
+
+    planned_blocks = set(spin_plans) | set(categorical_plans)
+    for group in runtime_groups:
+        if group.spin_block is None or group.categorical_block is None:
+            raise ValueError(f"TT-Lang runtime expects one spin and one categorical update per group: {group}")
+        supported_group_blocks = {block for block in (group.spin_block, group.categorical_block) if block is not None}
+        unexpected_group_blocks = set(group.block_indices) & planned_blocks - supported_group_blocks
+        if unexpected_group_blocks:
+            raise ValueError(f"unsupported TT-Lang grouped plan blocks: {tuple(sorted(unexpected_group_blocks))}")
 
 
 def supports_ttlang_discrete_runtime(program: BlockSamplingProgram) -> bool:
@@ -115,7 +112,10 @@ class TTLangDiscreteSweepRuntime:
 
         spin_plans = {plan.block_index: plan for plan in executor.spin_categorical_plans}
         categorical_plans = {plan.block_index: plan for plan in executor.categorical_spin_plans}
-        self.operations = _define_operations(ttl, spin_plans, categorical_plans)
+        self.groups = _make_runtime_groups(executor, spin_plans, categorical_plans)
+        self.operations = _define_operations(
+            ttl, spin_plans, categorical_plans, total_lanes=executor.layout.total_lanes
+        )
         self.constants = self._make_constants(spin_plans, categorical_plans)
         self._state_current: Any | None = None
         self._state_mid: Any | None = None
@@ -145,24 +145,29 @@ class TTLangDiscreteSweepRuntime:
         spin_threshold_logits = spin_threshold_logits or {}
         categorical_gumbel = categorical_gumbel or {}
 
-        unsupported_spin_blocks = set(spin_threshold_logits) - set(_SPIN_THRESHOLD_CONSTANTS)
+        spin_blocks = {plan.block_index for plan in self.executor.spin_categorical_plans}
+        categorical_blocks = {plan.block_index for plan in self.executor.categorical_spin_plans}
+
+        unsupported_spin_blocks = set(spin_threshold_logits) - spin_blocks
         if unsupported_spin_blocks:
             raise ValueError(f"unsupported TT-Lang spin threshold blocks: {tuple(sorted(unsupported_spin_blocks))}")
-        unsupported_categorical_blocks = set(categorical_gumbel) - set(_CATEGORICAL_GUMBEL_CONSTANTS)
+        unsupported_categorical_blocks = set(categorical_gumbel) - categorical_blocks
         if unsupported_categorical_blocks:
             raise ValueError(
                 f"unsupported TT-Lang categorical gumbel blocks: {tuple(sorted(unsupported_categorical_blocks))}"
             )
 
-        for block_index, key in _SPIN_THRESHOLD_CONSTANTS.items():
+        for block_index in sorted(spin_blocks):
             value = float(spin_threshold_logits.get(block_index, 0.0))
-            self.constants[key] = self.from_torch(torch.full((TILE, TILE), value, dtype=torch.bfloat16))
+            self.constants[_spin_key(block_index, "threshold")] = self.from_torch(
+                torch.full((TILE, TILE), value, dtype=torch.bfloat16)
+            )
 
-        for block_index, key in _CATEGORICAL_GUMBEL_CONSTANTS.items():
+        for block_index in sorted(categorical_blocks):
             values = tuple(float(v) for v in categorical_gumbel.get(block_index, (0.0, 0.0, 0.0)))
             if len(values) != N_CATEGORIES:
                 raise ValueError(f"TT-Lang categorical gumbel block {block_index} expects {N_CATEGORIES} values")
-            self.constants[key] = self.from_torch(tile_planes(list(values)))
+            self.constants[_categorical_key(block_index, "gumbel")] = self.from_torch(tile_planes(list(values)))
 
     def run_sweep(self) -> None:
         current, mid, next_state = self._require_state()
@@ -204,63 +209,61 @@ class TTLangDiscreteSweepRuntime:
 
     def _make_constants(self, spin_plans: dict[int, Any], categorical_plans: dict[int, Any]) -> dict[str, Any]:
         torch = _torch()
-        return {
+        constants = {
             "one": self.from_torch(torch.ones((TILE, TILE), dtype=torch.bfloat16)),
             "half": self.from_torch(torch.full((TILE, TILE), 0.5, dtype=torch.bfloat16)),
-            "threshold0": self.from_torch(torch.zeros((TILE, TILE), dtype=torch.bfloat16)),
-            "threshold1": self.from_torch(torch.zeros((TILE, TILE), dtype=torch.bfloat16)),
-            "gumbel0": self.from_torch(torch.zeros((N_CATEGORIES * TILE, TILE), dtype=torch.bfloat16)),
-            "gumbel1": self.from_torch(torch.zeros((N_CATEGORIES * TILE, TILE), dtype=torch.bfloat16)),
-            "spin0_weights": self.from_torch(tile_planes(list(spin_plans[0].categorical_weights[0]))),
-            "spin0_bias": self.from_torch(torch.full((TILE, TILE), spin_plans[0].bias, dtype=torch.bfloat16)),
-            "cat0_weights": self.from_torch(tile_planes(list(categorical_plans[1].spin_weights[0]))),
-            "cat0_bias": self.from_torch(tile_planes(list(categorical_plans[1].bias))),
-            "spin1_weights": self.from_torch(tile_planes(list(spin_plans[3].categorical_weights[0]))),
-            "spin1_bias": self.from_torch(torch.full((TILE, TILE), spin_plans[3].bias, dtype=torch.bfloat16)),
-            "cat1_weights": self.from_torch(tile_planes(list(categorical_plans[4].spin_weights[0]))),
-            "cat1_bias": self.from_torch(tile_planes(list(categorical_plans[4].bias))),
         }
+        for block_index, plan in sorted(spin_plans.items()):
+            constants[_spin_key(block_index, "threshold")] = self.from_torch(
+                torch.zeros((TILE, TILE), dtype=torch.bfloat16)
+            )
+            constants[_spin_key(block_index, "weights")] = self.from_torch(
+                tile_planes(list(plan.categorical_weights[0]))
+            )
+            constants[_spin_key(block_index, "bias")] = self.from_torch(
+                torch.full((TILE, TILE), plan.bias, dtype=torch.bfloat16)
+            )
+        for block_index, plan in sorted(categorical_plans.items()):
+            constants[_categorical_key(block_index, "gumbel")] = self.from_torch(
+                torch.zeros((N_CATEGORIES * TILE, TILE), dtype=torch.bfloat16)
+            )
+            constants[_categorical_key(block_index, "weights")] = self.from_torch(
+                tile_planes(list(plan.spin_weights[0]))
+            )
+            constants[_categorical_key(block_index, "bias")] = self.from_torch(tile_planes(list(plan.bias)))
+        return constants
 
     def _run_discrete_sweep(self, state_in: Any, state_mid: Any, state_out: Any) -> None:
         ops = self.operations
         constants = self.constants
-        ops.copy_state_10(state_in, state_mid)
-        ops.spin_group0(
-            state_in,
-            constants["spin0_weights"],
-            constants["spin0_bias"],
-            constants["threshold0"],
-            constants["half"],
-            state_mid,
-        )
-        ops.categorical_group0(
-            state_in,
-            constants["cat0_weights"],
-            constants["cat0_bias"],
-            constants["gumbel0"],
-            constants["one"],
-            constants["half"],
-            state_mid,
-        )
+        state_buffers = (state_in, state_mid, state_out)
+        for group_index, group in enumerate(self.groups):
+            group_in = state_buffers[group_index]
+            group_out = state_buffers[group_index + 1]
+            ops.copy_state(group_in, group_out)
 
-        ops.copy_state_10(state_mid, state_out)
-        ops.spin_group1(
-            state_mid,
-            constants["spin1_weights"],
-            constants["spin1_bias"],
-            constants["threshold1"],
-            constants["half"],
-            state_out,
-        )
-        ops.categorical_group1(
-            state_mid,
-            constants["cat1_weights"],
-            constants["cat1_bias"],
-            constants["gumbel1"],
-            constants["one"],
-            constants["half"],
-            state_out,
-        )
+            spin_block = group.spin_block
+            if spin_block is not None:
+                ops.spin_updates[spin_block](
+                    group_in,
+                    constants[_spin_key(spin_block, "weights")],
+                    constants[_spin_key(spin_block, "bias")],
+                    constants[_spin_key(spin_block, "threshold")],
+                    constants["half"],
+                    group_out,
+                )
+
+            categorical_block = group.categorical_block
+            if categorical_block is not None:
+                ops.categorical_updates[categorical_block](
+                    group_in,
+                    constants[_categorical_key(categorical_block, "weights")],
+                    constants[_categorical_key(categorical_block, "bias")],
+                    constants[_categorical_key(categorical_block, "gumbel")],
+                    constants["one"],
+                    constants["half"],
+                    group_out,
+                )
 
     def _require_state(self) -> tuple[Any, Any, Any]:
         if self._state_current is None or self._state_mid is None or self._state_next is None:
@@ -274,40 +277,77 @@ def _torch() -> Any:
     return torch
 
 
+@dataclass(frozen=True)
+class _RuntimeGroup:
+    block_indices: tuple[int, ...]
+    spin_block: int | None
+    categorical_block: int | None
+
+
 class _Operations:
-    def __init__(self, *, copy_state_10, spin_group0, categorical_group0, spin_group1, categorical_group1):
-        self.copy_state_10 = copy_state_10
-        self.spin_group0 = spin_group0
-        self.categorical_group0 = categorical_group0
-        self.spin_group1 = spin_group1
-        self.categorical_group1 = categorical_group1
+    def __init__(self, *, copy_state, spin_updates: dict[int, Any], categorical_updates: dict[int, Any]):
+        self.copy_state = copy_state
+        self.spin_updates = spin_updates
+        self.categorical_updates = categorical_updates
 
 
-def _define_operations(ttl_module: Any, spin_plans: dict[int, Any], categorical_plans: dict[int, Any]) -> _Operations:
+def _spin_key(block_index: int, name: str) -> str:
+    return f"spin:{block_index}:{name}"
+
+
+def _categorical_key(block_index: int, name: str) -> str:
+    return f"categorical:{block_index}:{name}"
+
+
+def _make_runtime_groups(
+    executor: "ExperimentalTTLangExecutor", spin_plans: dict[int, Any], categorical_plans: dict[int, Any]
+) -> tuple[_RuntimeGroup, ...]:
+    groups = []
+    for block_indices in executor.sampling_order:
+        spin_blocks = tuple(block for block in block_indices if block in spin_plans)
+        categorical_blocks = tuple(block for block in block_indices if block in categorical_plans)
+        if len(spin_blocks) > 1 or len(categorical_blocks) > 1:
+            raise ValueError(f"unsupported TT-Lang sampling order group shape: {block_indices}")
+        groups.append(
+            _RuntimeGroup(
+                block_indices=tuple(block_indices),
+                spin_block=spin_blocks[0] if spin_blocks else None,
+                categorical_block=categorical_blocks[0] if categorical_blocks else None,
+            )
+        )
+    return tuple(groups)
+
+
+def _define_operations(
+    ttl_module: Any, spin_plans: dict[int, Any], categorical_plans: dict[int, Any], *, total_lanes: int
+) -> _Operations:
     global ttl
     ttl = ttl_module
 
-    @ttl.operation(grid=(1, 1))
-    def copy_state_10(inp, out):
-        lane_dfb = ttl.make_dataflow_buffer_like(inp, shape=(1, 1), block_count=10)
+    def define_copy_state(n_lanes: int):
+        @ttl.operation(grid=(1, 1))
+        def copy_state(inp, out):
+            lane_dfb = ttl.make_dataflow_buffer_like(inp, shape=(1, 1), block_count=n_lanes)
 
-        @ttl.compute()
-        def compute():
-            pass
+            @ttl.compute()
+            def compute():
+                pass
 
-        @ttl.datamovement()
-        def read():
-            for lane in range(10):
-                with lane_dfb.reserve() as lane_blk:
-                    tx_in = ttl.copy(inp[lane, 0], lane_blk)
-                    tx_in.wait()
+            @ttl.datamovement()
+            def read():
+                for lane in range(n_lanes):
+                    with lane_dfb.reserve() as lane_blk:
+                        tx_in = ttl.copy(inp[lane, 0], lane_blk)
+                        tx_in.wait()
 
-        @ttl.datamovement()
-        def write():
-            for lane in range(10):
-                with lane_dfb.wait() as lane_blk:
-                    tx_out = ttl.copy(lane_blk, out[lane, 0])
-                    tx_out.wait()
+            @ttl.datamovement()
+            def write():
+                for lane in range(n_lanes):
+                    with lane_dfb.wait() as lane_blk:
+                        tx_out = ttl.copy(lane_blk, out[lane, 0])
+                        tx_out.wait()
+
+        return copy_state
 
     def define_spin_update(source_start: int, output_lane: int):
         @ttl.operation(grid=(1, 1))
@@ -450,21 +490,19 @@ def _define_operations(ttl_module: Any, spin_plans: dict[int, Any], categorical_
         return categorical_update
 
     return _Operations(
-        copy_state_10=copy_state_10,
-        spin_group0=define_spin_update(
-            source_start=spin_plans[0].categorical_lane_groups[0][0],
-            output_lane=spin_plans[0].output_lane,
-        ),
-        categorical_group0=define_categorical_update(
-            source_lane=categorical_plans[1].spin_lanes[0],
-            output_start=categorical_plans[1].output_lanes[0],
-        ),
-        spin_group1=define_spin_update(
-            source_start=spin_plans[3].categorical_lane_groups[0][0],
-            output_lane=spin_plans[3].output_lane,
-        ),
-        categorical_group1=define_categorical_update(
-            source_lane=categorical_plans[4].spin_lanes[0],
-            output_start=categorical_plans[4].output_lanes[0],
-        ),
+        copy_state=define_copy_state(total_lanes),
+        spin_updates={
+            block_index: define_spin_update(
+                source_start=plan.categorical_lane_groups[0][0],
+                output_lane=plan.output_lane,
+            )
+            for block_index, plan in sorted(spin_plans.items())
+        },
+        categorical_updates={
+            block_index: define_categorical_update(
+                source_lane=plan.spin_lanes[0],
+                output_start=plan.output_lanes[0],
+            )
+            for block_index, plan in sorted(categorical_plans.items())
+        },
     )

@@ -79,11 +79,14 @@ python scripts/run_ttlang_discrete_sweep.py --warmup 10 --benchmark 100 --json
 
 For QuietBox validation, run inside the `tt-lang-codex` TT-Lang container or
 through `dispatch` with a Wormhole device allocation. The container must expose
-the TT device, hugepages, 1G hugepage sysfs, and host networking for dependency
-installation:
+the TT device, hugepages, 1G hugepage sysfs, host networking for dependency
+installation, and `nofile`/`nproc` limits no higher than QuietBox's SSH hard
+limit so `podman exec` works from both SSH and dispatch sessions:
 
 ```bash
 podman run -d --privileged --network host --name tt-lang-codex \
+  --ulimit nofile=524288:524288 \
+  --ulimit nproc=524288:524288 \
   --device=/dev/tenstorrent/0:/dev/tenstorrent/0 \
   -v /dev/hugepages:/dev/hugepages \
   -v /dev/hugepages-1G:/dev/hugepages-1G \
@@ -95,9 +98,10 @@ podman run -d --privileged --network host --name tt-lang-codex \
 Current cleanup HEAD passed on QuietBox:
 
 ```text
-j-quietbox-ttlang-ttfirst-cleanup-bench-iko2j5
+j-quietbox-ttlang-after-board-reset-bench-in8osz
 PASS: TT-Lang THRML discrete sweep
-50 sweeps, 32.40 ms total, 0.648 ms/sweep, 6 dispatches/sweep
+2 warmup sweeps, 10 measured sweeps
+6.99 ms total, 0.699 ms/sweep, 6 dispatches/sweep
 ```
 
 Earlier warm-container runs of the same TT-Lang path measured about

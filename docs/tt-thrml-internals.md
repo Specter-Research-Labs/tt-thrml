@@ -57,6 +57,12 @@ That is six TT-Lang dispatches per sweep. The next major optimization target is
 to reduce dispatch count by fusing per-group copy and update work without
 breaking TT-Lang dataflow balance.
 
+Hardware note: bad fused-kernel experiments can leave Wormhole dispatch cores
+running after the host process is killed. If TT-Metal reports unexpected
+`run_mailbox` values or active ethernet dispatch cores during initialization,
+clear the board with `tt-smi -r all --no_reinit` from the TT-Lang container
+before rerunning benchmarks.
+
 ## Randomness
 
 The current runner exposes deterministic per-block inputs:

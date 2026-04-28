@@ -64,9 +64,20 @@ The current runner exposes deterministic per-block inputs:
 - spin threshold logits
 - categorical Gumbel values
 
-Those constants are uploaded to device tensors before sweeps. General THRML RNG
-generation should land as TT-Lang-first runtime work, not by reintroducing a
-second backend path.
+Those constants are uploaded to device tensors before sweeps. They can also be
+derived from a JAX key with `TTLangProgramPlanner.sweep_randomness_from_key` or
+`TTLangDiscreteSweepRuntime.set_sweep_randomness_from_key`.
+
+The key derivation matches THRML's one-sweep sampling path:
+
+1. split the sweep key once per free block
+2. split each block key once inside the parametric sampler
+3. use the first sampler subkey for the Bernoulli or categorical draw
+
+For TT-Lang, Bernoulli draws are represented as logit thresholds and categorical
+draws are represented as Gumbel-max perturbations. The next runtime step is to
+batch full sweep windows in device-resident randomness buffers rather than
+replacing constants one sweep at a time.
 
 ## Device Ownership
 

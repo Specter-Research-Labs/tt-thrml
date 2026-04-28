@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -62,6 +63,8 @@ def _assert_state_lists_equal(result: list[object], expected: list[object], *, l
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--benchmark", type=int, default=0, metavar="N", help="run N timed device-resident sweeps")
+    parser.add_argument("--warmup", type=int, default=0, metavar="N", help="run N untimed sweeps before benchmarking")
+    parser.add_argument("--json", action="store_true", help="emit the benchmark record as JSON")
     args = parser.parse_args()
 
     ttnn = _require_ttnn()
@@ -96,6 +99,12 @@ def main() -> None:
 
         if args.benchmark:
             n = int(args.benchmark)
+            warmup = int(args.warmup)
+            if warmup < 0:
+                raise ValueError("--warmup must be non-negative")
+            if warmup:
+                runtime.run_sweeps(warmup)
+                expected_lanes = executor.evaluate_discrete_sweeps(expected_lanes, warmup, **sweep_kwargs)
             elapsed_ms = runtime.run_sweeps(n)
             expected_after_benchmark = executor.evaluate_discrete_sweeps(expected_lanes, n, **sweep_kwargs)
             expected_state_after_benchmark = decode_state(executor.layout, expected_after_benchmark)
@@ -106,15 +115,17 @@ def main() -> None:
                 expected_state_after_benchmark,
                 label=f"{n + 1} sweeps",
             )
-            print(
-                "benchmark",
-                {
-                    "sweeps": n,
-                    "total_ms": elapsed_ms,
-                    "ms_per_sweep": elapsed_ms / n,
-                    "dispatches_per_sweep": runtime.dispatches_per_sweep,
-                },
-            )
+            record = {
+                "warmup_sweeps": warmup,
+                "measured_sweeps": n,
+                "total_ms": elapsed_ms,
+                "ms_per_sweep": elapsed_ms / n,
+                "dispatches_per_sweep": runtime.dispatches_per_sweep,
+            }
+            if args.json:
+                print(json.dumps(record, sort_keys=True))
+            else:
+                print("benchmark", record)
     finally:
         ttnn.close_device(device)
 

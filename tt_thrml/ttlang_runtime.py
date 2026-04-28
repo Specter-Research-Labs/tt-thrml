@@ -169,6 +169,14 @@ class TTLangDiscreteSweepRuntime:
                 raise ValueError(f"TT-Lang categorical gumbel block {block_index} expects {N_CATEGORIES} values")
             self.constants[_categorical_key(block_index, "gumbel")] = self.from_torch(tile_planes(list(values)))
 
+    def set_sweep_randomness_from_key(self, key: Any) -> None:
+        """Upload one sweep of random inputs using THRML's JAX key schedule."""
+        randomness = self.executor.sweep_randomness_from_key(key)
+        self.set_sweep_randomness(
+            spin_threshold_logits=randomness.spin_threshold_logits,
+            categorical_gumbel=randomness.categorical_gumbel,
+        )
+
     def run_sweep(self) -> None:
         current, mid, next_state = self._require_state()
         self._run_discrete_sweep(current, mid, next_state)

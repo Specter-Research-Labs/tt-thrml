@@ -17,6 +17,8 @@ from tt_thrml.ttlang_backend import (
     evaluate_categorical_spin_plan,
     evaluate_spin_categorical_plan,
     expand_categorical_gather_lanes,
+    make_chain_sweep_randomness_from_key,
+    make_sweep_randomness_from_key,
 )
 from tt_thrml.ttlang_runtime import supports_ttlang_discrete_runtime, validate_ttlang_discrete_runtime
 
@@ -262,6 +264,29 @@ def test_ttlang_program_planner_evaluates_repeated_supported_discrete_sweeps():
         executor.evaluate_discrete_sweeps(state_lanes, 0, **sweep_kwargs),
         state_lanes,
     )
+
+
+def test_ttlang_sweep_randomness_follows_thrml_key_schedule():
+    import jax
+    import jax.numpy as jnp
+
+    executor = TTLangProgramPlanner(make_mixed_spin_categorical_gaussian_program())
+    key = jax.random.PRNGKey(17)
+
+    randomness = make_sweep_randomness_from_key(executor, key)
+    block_keys = jax.random.split(key, (len(executor.program.gibbs_spec.free_blocks),))
+
+    spin_key = jax.random.split(block_keys[0], 2)[0]
+    spin_uniform = jax.random.uniform(spin_key, (), dtype=jnp.float32)
+    assert randomness.spin_threshold_logits[0] == pytest.approx(float(jnp.log(spin_uniform) - jnp.log1p(-spin_uniform)))
+
+    categorical_key = jax.random.split(block_keys[1], 2)[0]
+    categorical_gumbel = jax.random.gumbel(categorical_key, (3,), dtype=jnp.float32)
+    np.testing.assert_allclose(randomness.categorical_gumbel[1], np.asarray(categorical_gumbel))
+
+    chain_randomness = make_chain_sweep_randomness_from_key(executor, key, sweep_index=2, n_sweeps=5)
+    direct_randomness = make_sweep_randomness_from_key(executor, jax.random.split(key, 5)[2])
+    assert chain_randomness == direct_randomness
 
 
 def test_ttlang_runtime_support_boundary_accepts_only_proven_discrete_shape():

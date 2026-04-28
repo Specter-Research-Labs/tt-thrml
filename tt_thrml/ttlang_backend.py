@@ -13,7 +13,7 @@ floats. Only the device-resident backend state changes shape.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np
 from thrml.block_sampling import BlockSamplingProgram
@@ -105,6 +105,20 @@ class TTLangCategoricalSpinRun:
     gumbel: tuple[float, ...]
     expected_category: int
     expected_one_hot: tuple[float, ...]
+
+
+@dataclass(frozen=True)
+class TTLangSweepRandomness:
+    """Per-block random inputs consumed by the TT-Lang discrete runtime."""
+
+    spin_threshold_logits: Mapping[int, float]
+    categorical_gumbel: Mapping[int, tuple[float, ...]]
+
+    def as_kwargs(self) -> dict[str, Mapping[int, object]]:
+        return {
+            "spin_threshold_logits": self.spin_threshold_logits,
+            "categorical_gumbel": self.categorical_gumbel,
+        }
 
 
 @dataclass(frozen=True)
@@ -248,6 +262,17 @@ class TTLangProgramPlanner:
                 categorical_gumbel=categorical_gumbel,
             )
         return current
+
+    def sweep_randomness_from_key(self, key: Any) -> TTLangSweepRandomness:
+        """Generate TT-Lang runtime randomness using THRML's per-sweep key schedule.
+
+        THRML `sample_blocks` splits one sweep key by free block, then
+        parametric samplers split each block key again and use the first subkey
+        for the distribution draw. Spin updates consume the Bernoulli draw as a
+        logit threshold; categorical updates consume the equivalent Gumbel-max
+        perturbations for `jax.random.categorical`.
+        """
+        return make_sweep_randomness_from_key(self, key)
 
 
 def _as_spec(block_or_spec: CompiledFusedBlock | FusedBlockSpec) -> FusedBlockSpec:
@@ -731,3 +756,43 @@ def evaluate_categorical_spin_plan(
         scores = scores + lanes[spin_lane] * np.asarray(weight_group, dtype=np.float32)
     perturbed = scores + np.asarray(gumbel, dtype=np.float32)
     return int(perturbed.argmax())
+
+
+def make_sweep_randomness_from_key(executor: TTLangProgramPlanner, key: Any) -> TTLangSweepRandomness:
+    """Generate one sweep of runtime randomness from a THRML/JAX sweep key."""
+    import jax
+    import jax.numpy as jnp
+
+    n_free = len(executor.program.gibbs_spec.free_blocks)
+    block_keys = jax.random.split(key, (n_free,))
+    spin_threshold_logits: dict[int, float] = {}
+    categorical_gumbel: dict[int, tuple[float, ...]] = {}
+
+    for plan in executor.spin_categorical_plans:
+        sample_key = jax.random.split(block_keys[plan.block_index], 2)[0]
+        uniform = jax.random.uniform(sample_key, (), dtype=jnp.float32)
+        spin_threshold_logits[plan.block_index] = float(jnp.log(uniform) - jnp.log1p(-uniform))
+
+    for plan in executor.categorical_spin_plans:
+        sample_key = jax.random.split(block_keys[plan.block_index], 2)[0]
+        gumbel = jax.random.gumbel(sample_key, (plan.n_categories,), dtype=jnp.float32)
+        categorical_gumbel[plan.block_index] = tuple(float(value) for value in np.asarray(gumbel))
+
+    return TTLangSweepRandomness(
+        spin_threshold_logits=spin_threshold_logits,
+        categorical_gumbel=categorical_gumbel,
+    )
+
+
+def make_chain_sweep_randomness_from_key(
+    executor: TTLangProgramPlanner, key: Any, *, sweep_index: int, n_sweeps: int
+) -> TTLangSweepRandomness:
+    """Generate runtime randomness for one sweep inside THRML's scanned chain key schedule."""
+    if sweep_index < 0:
+        raise ValueError("sweep_index must be non-negative")
+    if n_sweeps <= sweep_index:
+        raise ValueError("n_sweeps must be greater than sweep_index")
+
+    import jax
+
+    return make_sweep_randomness_from_key(executor, jax.random.split(key, n_sweeps)[sweep_index])

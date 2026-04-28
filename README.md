@@ -74,6 +74,7 @@ python scripts/run_ttlang_spin_categorical_plan.py
 python scripts/run_ttlang_categorical_spin_plan.py
 python scripts/run_ttlang_discrete_sweep.py
 python scripts/run_ttlang_discrete_sweep.py --benchmark 50
+python scripts/run_ttlang_discrete_sweep.py --warmup 10 --benchmark 100 --json
 ```
 
 For QuietBox validation, run inside the `tt-lang-codex` TT-Lang container or
@@ -101,6 +102,19 @@ PASS: TT-Lang THRML discrete sweep
 
 Earlier warm-container runs of the same TT-Lang path measured about
 0.64-0.66 ms/sweep.
+
+## Randomness
+
+The runtime accepts explicit per-block random inputs for deterministic tests,
+and it can derive those inputs from a JAX key using THRML's own schedule:
+
+```python
+runtime.set_sweep_randomness_from_key(jax.random.PRNGKey(0))
+```
+
+This mirrors THRML's per-sweep block-key split and sampler-key split. Spin
+blocks receive Bernoulli logit thresholds; categorical blocks receive Gumbel-max
+perturbations.
 
 ## Install
 

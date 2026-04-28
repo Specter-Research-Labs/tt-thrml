@@ -363,3 +363,18 @@ def test_ttlang_runtime_supports_more_independent_sampling_groups():
     executor.sampling_order = executor.sampling_order[:2]
     with pytest.raises(ValueError, match="omits planned blocks"):
         validate_ttlang_discrete_runtime(executor)
+
+
+def test_ttlang_planner_combines_duplicate_discrete_terms():
+    program = make_mixed_spin_categorical_gaussian_program(n_pairs=1, n_discrete_terms=2)
+    executor = TTLangProgramPlanner(program)
+
+    spin_plan = executor.spin_categorical_plans[0]
+    categorical_plan = executor.categorical_spin_plans[0]
+
+    assert spin_plan.categorical_lane_groups == ((1, 2, 3),)
+    assert spin_plan.categorical_weights == ((1.100000023841858, -0.5, 0.30000001192092896),)
+    assert categorical_plan.spin_lanes == (0,)
+    assert categorical_plan.spin_weights == ((1.100000023841858, -0.5, 0.30000001192092896),)
+    assert supports_ttlang_discrete_runtime(program)
+    validate_ttlang_discrete_runtime(executor)

@@ -68,13 +68,22 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=0, metavar="N", help="run N untimed sweeps before benchmarking")
     parser.add_argument("--seed", type=int, default=0, help="JAX PRNG seed for the THRML chain randomness window")
     parser.add_argument("--pairs", type=int, default=2, help="number of independent spin/categorical/gaussian groups")
+    parser.add_argument(
+        "--discrete-terms",
+        type=int,
+        default=1,
+        help="number of duplicate spin/categorical interaction terms per pair",
+    )
     parser.add_argument("--json", action="store_true", help="emit the benchmark record as JSON")
     args = parser.parse_args()
 
     import jax
 
     ttnn = _require_ttnn()
-    program = make_mixed_spin_categorical_gaussian_program(n_pairs=args.pairs)
+    program = make_mixed_spin_categorical_gaussian_program(
+        n_pairs=args.pairs,
+        n_discrete_terms=args.discrete_terms,
+    )
     executor = TTLangProgramPlanner(program)
     initial_state = _initial_state(args.pairs)
     initial_lanes = executor.encode_state(initial_state)

@@ -91,10 +91,14 @@ class CouplingFactor(AbstractFactor):
         ]
 
 
-def make_mixed_spin_categorical_gaussian_program(*, n_categories: int = 3, n_pairs: int = 2) -> FactorSamplingProgram:
+def make_mixed_spin_categorical_gaussian_program(
+    *, n_categories: int = 3, n_pairs: int = 2, n_discrete_terms: int = 1
+) -> FactorSamplingProgram:
     """Build the mixed smoke program shared by parity tests and TT-Lang runners."""
     if n_pairs <= 0:
         raise ValueError("n_pairs must be positive")
+    if n_discrete_terms <= 0:
+        raise ValueError("n_discrete_terms must be positive")
 
     spin_nodes = [SpinNode() for _ in range(n_pairs)]
     categorical_nodes = [CategoricalNode() for _ in range(n_pairs)]
@@ -135,11 +139,6 @@ def make_mixed_spin_categorical_gaussian_program(*, n_categories: int = 3, n_pai
             [Block(categorical_nodes)],
             categorical_bias,
         ),
-        DiscreteEBMFactor(
-            [Block(spin_nodes)],
-            [Block(categorical_nodes)],
-            discrete_weights,
-        ),
         LinearFactor(
             linear_weights,
             Block(continuous_nodes),
@@ -149,6 +148,14 @@ def make_mixed_spin_categorical_gaussian_program(*, n_categories: int = 3, n_pai
             Block(continuous_nodes),
         ),
     ]
+    for _ in range(n_discrete_terms):
+        factors.append(
+            DiscreteEBMFactor(
+                [Block(spin_nodes)],
+                [Block(categorical_nodes)],
+                discrete_weights,
+            )
+        )
     if n_pairs >= 2:
         factors.append(
             CouplingFactor(

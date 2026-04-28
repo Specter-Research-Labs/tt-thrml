@@ -696,8 +696,7 @@ def build_spin_categorical_plan(layout: TTLangStateLayout, spec: FusedBlockSpec)
         raise ValueError("TT-Lang spin categorical plan currently supports one-node spin blocks")
 
     bias = 0.0
-    lane_groups: list[tuple[int, ...]] = []
-    weight_groups: list[tuple[float, ...]] = []
+    weights_by_lanes: dict[tuple[int, ...], np.ndarray] = {}
 
     for interaction in spec.interactions:
         weighted_mask = np.asarray(interaction.weighted_mask, dtype=np.float32)
@@ -719,16 +718,18 @@ def build_spin_categorical_plan(layout: TTLangStateLayout, spec: FusedBlockSpec)
         weights = weighted_mask.reshape(interaction.n_terms, n_categories)
         lanes = expanded_lanes.reshape(interaction.n_terms, n_categories)
         for term_lanes, term_weights in zip(lanes, weights, strict=True):
-            lane_groups.append(tuple(int(v) for v in term_lanes))
-            weight_groups.append(tuple(float(v) for v in term_weights))
+            lane_group = tuple(int(v) for v in term_lanes)
+            weights_by_lanes[lane_group] = weights_by_lanes.get(
+                lane_group, np.zeros((n_categories,), dtype=np.float32)
+            ) + np.asarray(term_weights, dtype=np.float32)
 
     output_lane = layout.node_lane_start(spec.block_global_start)
     return TTLangSpinCategoricalPlan(
         block_index=spec.block_index,
         output_lane=output_lane,
         bias=bias,
-        categorical_lane_groups=tuple(lane_groups),
-        categorical_weights=tuple(weight_groups),
+        categorical_lane_groups=tuple(weights_by_lanes),
+        categorical_weights=tuple(tuple(float(v) for v in weights) for weights in weights_by_lanes.values()),
     )
 
 
@@ -743,8 +744,7 @@ def build_categorical_spin_plan(layout: TTLangStateLayout, spec: FusedBlockSpec)
         raise ValueError("categorical block is missing n_categories")
 
     bias = np.zeros((n_categories,), dtype=np.float32)
-    spin_lanes: list[int] = []
-    spin_weights: list[tuple[float, ...]] = []
+    weights_by_spin_lane: dict[int, np.ndarray] = {}
 
     for interaction in spec.interactions:
         weighted_mask = np.asarray(interaction.weighted_mask, dtype=np.float32)
@@ -761,16 +761,18 @@ def build_categorical_spin_plan(layout: TTLangStateLayout, spec: FusedBlockSpec)
 
         gather_indices = np.asarray(interaction.gather_indices[0], dtype=np.int32).reshape(interaction.n_terms)
         for scalar_index, term_weights in zip(gather_indices, weights, strict=True):
-            spin_lanes.append(layout.node_lane_start(int(scalar_index)))
-            spin_weights.append(tuple(float(v) for v in term_weights))
+            spin_lane = layout.node_lane_start(int(scalar_index))
+            weights_by_spin_lane[spin_lane] = weights_by_spin_lane.get(
+                spin_lane, np.zeros((n_categories,), dtype=np.float32)
+            ) + np.asarray(term_weights, dtype=np.float32)
 
     output_start = layout.node_lane_start(spec.block_global_start)
     return TTLangCategoricalSpinPlan(
         block_index=spec.block_index,
         output_lanes=tuple(output_start + category for category in range(n_categories)),
         bias=tuple(float(v) for v in bias),
-        spin_lanes=tuple(spin_lanes),
-        spin_weights=tuple(spin_weights),
+        spin_lanes=tuple(weights_by_spin_lane),
+        spin_weights=tuple(tuple(float(v) for v in weights) for weights in weights_by_spin_lane.values()),
     )
 
 

@@ -91,22 +91,21 @@ class CouplingFactor(AbstractFactor):
         ]
 
 
-def make_mixed_spin_categorical_gaussian_program(*, n_categories: int = 3) -> FactorSamplingProgram:
+def make_mixed_spin_categorical_gaussian_program(*, n_categories: int = 3, n_pairs: int = 2) -> FactorSamplingProgram:
     """Build the mixed smoke program shared by parity tests and TT-Lang runners."""
-    spin_nodes = [SpinNode() for _ in range(2)]
-    categorical_nodes = [CategoricalNode() for _ in range(2)]
-    continuous_nodes = [ContinuousNode() for _ in range(2)]
+    if n_pairs <= 0:
+        raise ValueError("n_pairs must be positive")
+
+    spin_nodes = [SpinNode() for _ in range(n_pairs)]
+    categorical_nodes = [CategoricalNode() for _ in range(n_pairs)]
+    continuous_nodes = [ContinuousNode() for _ in range(n_pairs)]
     free_super_blocks = [
         (
-            Block([spin_nodes[0]]),
-            Block([categorical_nodes[0]]),
-            Block([continuous_nodes[0]]),
-        ),
-        (
-            Block([spin_nodes[1]]),
-            Block([categorical_nodes[1]]),
-            Block([continuous_nodes[1]]),
-        ),
+            Block([spin_nodes[i]]),
+            Block([categorical_nodes[i]]),
+            Block([continuous_nodes[i]]),
+        )
+        for i in range(n_pairs)
     ]
     node_shape_dtypes = cast(
         Any,
@@ -116,48 +115,58 @@ def make_mixed_spin_categorical_gaussian_program(*, n_categories: int = 3) -> Fa
             ContinuousNode: jax.ShapeDtypeStruct(shape=(), dtype=jnp.float32),
         },
     )
-    return FactorSamplingProgram(
-        BlockGibbsSpec(free_super_blocks, [], node_shape_dtypes),
-        [
-            SpinGibbsConditional(),
-            CategoricalGibbsConditional(n_categories),
-            GaussianConditional(),
-            SpinGibbsConditional(),
-            CategoricalGibbsConditional(n_categories),
-            GaussianConditional(),
-        ],
-        [
-            SpinEBMFactor(
-                [Block(spin_nodes)],
-                jnp.asarray([0.25, -0.2], dtype=jnp.float32),
-            ),
-            CategoricalEBMFactor(
-                [Block(categorical_nodes)],
-                jnp.asarray(
-                    [[0.2, -0.1, 0.0], [-0.15, 0.3, -0.05]],
-                    dtype=jnp.float32,
-                ),
-            ),
-            DiscreteEBMFactor(
-                [Block(spin_nodes)],
-                [Block(categorical_nodes)],
-                jnp.asarray(
-                    [[0.55, -0.25, 0.15], [-0.2, 0.4, 0.1]],
-                    dtype=jnp.float32,
-                ),
-            ),
-            LinearFactor(
-                jnp.asarray([0.1, -0.2], dtype=jnp.float32),
-                Block(continuous_nodes),
-            ),
-            QuadraticFactor(
-                jnp.asarray([0.85, 0.75], dtype=jnp.float32),
-                Block(continuous_nodes),
-            ),
+    base_spin_bias = jnp.asarray([0.25, -0.2], dtype=jnp.float32)
+    base_categorical_bias = jnp.asarray([[0.2, -0.1, 0.0], [-0.15, 0.3, -0.05]], dtype=jnp.float32)
+    base_discrete_weights = jnp.asarray([[0.55, -0.25, 0.15], [-0.2, 0.4, 0.1]], dtype=jnp.float32)
+    base_linear_weights = jnp.asarray([0.1, -0.2], dtype=jnp.float32)
+    base_inverse_weights = jnp.asarray([0.85, 0.75], dtype=jnp.float32)
+    repeats = (n_pairs + 1) // 2
+    spin_bias = jnp.tile(base_spin_bias, repeats)[:n_pairs]
+    categorical_bias = jnp.tile(base_categorical_bias, (repeats, 1))[:n_pairs, :n_categories]
+    discrete_weights = jnp.tile(base_discrete_weights, (repeats, 1))[:n_pairs, :n_categories]
+    linear_weights = jnp.tile(base_linear_weights, repeats)[:n_pairs]
+    inverse_weights = jnp.tile(base_inverse_weights, repeats)[:n_pairs]
+    factors: list[AbstractFactor] = [
+        SpinEBMFactor(
+            [Block(spin_nodes)],
+            spin_bias,
+        ),
+        CategoricalEBMFactor(
+            [Block(categorical_nodes)],
+            categorical_bias,
+        ),
+        DiscreteEBMFactor(
+            [Block(spin_nodes)],
+            [Block(categorical_nodes)],
+            discrete_weights,
+        ),
+        LinearFactor(
+            linear_weights,
+            Block(continuous_nodes),
+        ),
+        QuadraticFactor(
+            inverse_weights,
+            Block(continuous_nodes),
+        ),
+    ]
+    if n_pairs >= 2:
+        factors.append(
             CouplingFactor(
                 jnp.asarray([0.11], dtype=jnp.float32),
                 (Block([continuous_nodes[0]]), Block([continuous_nodes[1]])),
-            ),
+            )
+        )
+    return FactorSamplingProgram(
+        BlockGibbsSpec(free_super_blocks, [], node_shape_dtypes),
+        [
+            conditional
+            for _ in range(n_pairs)
+            for conditional in (
+                SpinGibbsConditional(),
+                CategoricalGibbsConditional(n_categories),
+                GaussianConditional(),
+            )
         ],
+        factors,
         [],
     )

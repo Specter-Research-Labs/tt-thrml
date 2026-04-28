@@ -23,15 +23,17 @@ def _require_ttnn():
     return ttnn
 
 
-def _initial_state() -> list[object]:
-    return [
-        [True],
-        [1],
-        [0.25],
-        [False],
-        [1],
-        [-0.75],
-    ]
+def _initial_state(n_pairs: int) -> list[object]:
+    states: list[object] = []
+    for pair_index in range(n_pairs):
+        states.extend(
+            [
+                [pair_index % 2 == 0],
+                [1],
+                [0.25 if pair_index % 2 == 0 else -0.75],
+            ]
+        )
+    return states
 
 
 def _assert_tiles_equal(result, expected_lanes: object, *, label: str) -> None:
@@ -65,15 +67,16 @@ def main() -> None:
     parser.add_argument("--benchmark", type=int, default=0, metavar="N", help="run N timed device-resident sweeps")
     parser.add_argument("--warmup", type=int, default=0, metavar="N", help="run N untimed sweeps before benchmarking")
     parser.add_argument("--seed", type=int, default=0, help="JAX PRNG seed for the THRML chain randomness window")
+    parser.add_argument("--pairs", type=int, default=2, help="number of independent spin/categorical/gaussian groups")
     parser.add_argument("--json", action="store_true", help="emit the benchmark record as JSON")
     args = parser.parse_args()
 
     import jax
 
     ttnn = _require_ttnn()
-    program = make_mixed_spin_categorical_gaussian_program()
+    program = make_mixed_spin_categorical_gaussian_program(n_pairs=args.pairs)
     executor = TTLangProgramPlanner(program)
-    initial_state = _initial_state()
+    initial_state = _initial_state(args.pairs)
     initial_lanes = executor.encode_state(initial_state)
     total_sweeps = max(1, int(args.benchmark), 1 + max(0, int(args.warmup)))
     randomness_window = executor.sweep_randomness_window_from_key(jax.random.PRNGKey(args.seed), total_sweeps)

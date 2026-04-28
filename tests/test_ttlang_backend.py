@@ -347,3 +347,19 @@ def test_ttlang_runtime_support_boundary_accepts_only_proven_discrete_shape():
     executor.sampling_order = ((0, 1, 2, 3, 4, 5),)
     with pytest.raises(ValueError, match="sampling order"):
         validate_ttlang_discrete_runtime(executor)
+
+
+def test_ttlang_runtime_supports_more_independent_sampling_groups():
+    program = make_mixed_spin_categorical_gaussian_program(n_pairs=3)
+    executor = TTLangProgramPlanner(program)
+
+    assert executor.layout.total_lanes == 15
+    assert executor.sampling_order == ((0, 1, 2), (3, 4, 5), (6, 7, 8))
+    assert [plan.block_index for plan in executor.spin_categorical_plans] == [0, 3, 6]
+    assert [plan.block_index for plan in executor.categorical_spin_plans] == [1, 4, 7]
+    assert supports_ttlang_discrete_runtime(program)
+    validate_ttlang_discrete_runtime(executor)
+
+    executor.sampling_order = executor.sampling_order[:2]
+    with pytest.raises(ValueError, match="omits planned blocks"):
+        validate_ttlang_discrete_runtime(executor)

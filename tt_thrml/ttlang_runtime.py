@@ -28,15 +28,12 @@ def state_tiles(lanes: Any) -> Any:
 
 
 def validate_ttlang_discrete_runtime(executor: "TTLangProgramPlanner") -> None:
-    """Validate the narrow program shape currently backed by hardware kernels."""
-    if executor.layout.total_lanes != 10:
-        raise ValueError(f"TT-Lang discrete runtime expects 10 lanes, got {executor.layout.total_lanes}")
-
+    """Validate the discrete program shape currently backed by hardware kernels."""
     spin_plans = {plan.block_index: plan for plan in executor.spin_categorical_plans}
     categorical_plans = {plan.block_index: plan for plan in executor.categorical_spin_plans}
     runtime_groups = _make_runtime_groups(executor, spin_plans, categorical_plans)
-    if len(runtime_groups) != 2:
-        raise ValueError(f"TT-Lang discrete runtime expects 2 sampling groups, got {len(runtime_groups)}")
+    if not runtime_groups:
+        raise ValueError("TT-Lang discrete runtime expects at least one sampling group")
 
     for block_index, plan in spin_plans.items():
         if plan.n_categorical_terms != 1:
@@ -46,6 +43,7 @@ def validate_ttlang_discrete_runtime(executor: "TTLangProgramPlanner") -> None:
             raise ValueError(f"unsupported TT-Lang categorical plan shape for block {block_index}")
 
     planned_blocks = set(spin_plans) | set(categorical_plans)
+    scheduled_planned_blocks: set[int] = set()
     prior_writes: set[int] = set()
     for group in runtime_groups:
         if group.spin_block is None or group.categorical_block is None:
@@ -54,10 +52,15 @@ def validate_ttlang_discrete_runtime(executor: "TTLangProgramPlanner") -> None:
         unexpected_group_blocks = set(group.block_indices) & planned_blocks - supported_group_blocks
         if unexpected_group_blocks:
             raise ValueError(f"unsupported TT-Lang grouped plan blocks: {tuple(sorted(unexpected_group_blocks))}")
+        scheduled_planned_blocks |= supported_group_blocks
         group_reads = _group_read_lanes(group, spin_plans, categorical_plans)
         if group_reads & prior_writes:
             raise ValueError("TT-Lang in-place runtime only supports independent sampling groups")
         prior_writes |= _group_write_lanes(group, spin_plans, categorical_plans)
+
+    missing_planned_blocks = planned_blocks - scheduled_planned_blocks
+    if missing_planned_blocks:
+        raise ValueError(f"TT-Lang sampling order omits planned blocks: {tuple(sorted(missing_planned_blocks))}")
 
 
 def supports_ttlang_discrete_runtime(program: BlockSamplingProgram) -> bool:
@@ -105,7 +108,7 @@ class TTLangDiscreteSweepRuntime:
     not read lanes written by earlier groups.
     """
 
-    dispatches_per_sweep = 2
+    dispatches_per_sweep: int
 
     def __init__(self, *, ttl: Any, ttnn: Any, device: Any, executor: "TTLangProgramPlanner"):
         validate_ttlang_discrete_runtime(executor)
@@ -119,6 +122,7 @@ class TTLangDiscreteSweepRuntime:
         self.spin_plans = spin_plans
         self.categorical_plans = categorical_plans
         self.groups = _make_runtime_groups(executor, spin_plans, categorical_plans)
+        self.dispatches_per_sweep = len(self.groups)
         self.operations = _define_operations(
             ttl,
             spin_plans,
@@ -147,31 +151,35 @@ class TTLangDiscreteSweepRuntime:
         torch = _torch()
         self._randomness_window_length = None
         self._randomness_cursor = 0
-        spin_threshold_logits = spin_threshold_logits or {}
-        categorical_gumbel = categorical_gumbel or {}
+        spin_threshold_logits_by_block: Mapping[int, float] = spin_threshold_logits or {}
+        categorical_gumbel_by_block: Mapping[int, Sequence[float]] = categorical_gumbel or {}
 
         spin_blocks = {plan.block_index for plan in self.executor.spin_categorical_plans}
         categorical_blocks = {plan.block_index for plan in self.executor.categorical_spin_plans}
 
-        unsupported_spin_blocks = set(spin_threshold_logits) - spin_blocks
+        unsupported_spin_blocks = set(spin_threshold_logits_by_block) - spin_blocks
         if unsupported_spin_blocks:
             raise ValueError(f"unsupported TT-Lang spin threshold blocks: {tuple(sorted(unsupported_spin_blocks))}")
-        unsupported_categorical_blocks = set(categorical_gumbel) - categorical_blocks
+        unsupported_categorical_blocks = set(categorical_gumbel_by_block) - categorical_blocks
         if unsupported_categorical_blocks:
             raise ValueError(
                 f"unsupported TT-Lang categorical gumbel blocks: {tuple(sorted(unsupported_categorical_blocks))}"
             )
 
         for block_index in sorted(spin_blocks):
-            value = float(spin_threshold_logits.get(block_index, 0.0))
+            value = float(spin_threshold_logits_by_block.get(block_index, 0.0))
             self.constants[_spin_key(block_index, "threshold")] = self.from_torch(
                 torch.full((TILE, TILE), value, dtype=torch.bfloat16)
             )
 
         for block_index in sorted(categorical_blocks):
-            values = tuple(float(v) for v in categorical_gumbel.get(block_index, (0.0, 0.0, 0.0)))
-            if len(values) != N_CATEGORIES:
-                raise ValueError(f"TT-Lang categorical gumbel block {block_index} expects {N_CATEGORIES} values")
+            plan = self.categorical_plans[block_index]
+            raw_values = categorical_gumbel_by_block.get(block_index)
+            if raw_values is None:
+                raw_values = tuple(0.0 for _ in range(plan.n_categories))
+            values = tuple(float(v) for v in raw_values)
+            if len(values) != plan.n_categories:
+                raise ValueError(f"TT-Lang categorical gumbel block {block_index} expects {plan.n_categories} values")
             self.constants[_categorical_key(block_index, "gumbel")] = self.from_torch(tile_planes(list(values)))
 
     def set_sweep_randomness_from_key(self, key: Any) -> None:
@@ -211,17 +219,20 @@ class TTLangDiscreteSweepRuntime:
             self.constants[_spin_key(block_index, "threshold")] = self.from_torch(tile_planes(list(values)))
 
         for block_index in sorted(categorical_blocks):
+            plan = self.categorical_plans[block_index]
             sweeps = tuple(
                 tuple(float(value) for value in values)
                 for values in randomness_window.categorical_gumbel.get(
-                    block_index, ((0.0, 0.0, 0.0),) * randomness_window.n_sweeps
+                    block_index, ((0.0,) * plan.n_categories,) * randomness_window.n_sweeps
                 )
             )
             if len(sweeps) != randomness_window.n_sweeps:
                 raise ValueError(f"TT-Lang categorical gumbel block {block_index} has the wrong window length")
             for values in sweeps:
-                if len(values) != N_CATEGORIES:
-                    raise ValueError(f"TT-Lang categorical gumbel block {block_index} expects {N_CATEGORIES} values")
+                if len(values) != plan.n_categories:
+                    raise ValueError(
+                        f"TT-Lang categorical gumbel block {block_index} expects {plan.n_categories} values"
+                    )
             self.constants[_categorical_key(block_index, "gumbel")] = self.from_torch(
                 tile_planes([value for values in sweeps for value in values])
             )
@@ -298,7 +309,7 @@ class TTLangDiscreteSweepRuntime:
             )
         for block_index, plan in sorted(categorical_plans.items()):
             constants[_categorical_key(block_index, "gumbel")] = self.from_torch(
-                torch.zeros((N_CATEGORIES * TILE, TILE), dtype=torch.bfloat16)
+                torch.zeros((plan.n_categories * TILE, TILE), dtype=torch.bfloat16)
             )
             constants[_categorical_key(block_index, "weights")] = self.from_torch(
                 tile_planes(list(plan.spin_weights[0]))

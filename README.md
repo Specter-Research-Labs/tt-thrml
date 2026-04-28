@@ -72,6 +72,7 @@ python scripts/run_ttlang_spin_categorical_plan.py
 python scripts/run_ttlang_categorical_spin_plan.py
 python scripts/run_ttlang_discrete_sweep.py
 python scripts/run_ttlang_discrete_sweep.py --benchmark 50
+python scripts/run_ttlang_discrete_sweep.py --pairs 3 --benchmark 50
 python scripts/run_ttlang_discrete_sweep.py --warmup 10 --benchmark 100 --json
 ```
 
@@ -93,19 +94,20 @@ podman run -d --privileged --network host --name tt-lang-codex \
 
 ## Latest Hardware Check
 
-Current cleanup HEAD passed on QuietBox:
+Current cleanup HEAD passed on QuietBox for both the original two-group shape
+and a three-group generalized shape:
 
 ```text
-j-quietbox-ttlang-window-steady-bench-irofxo
-PASS: TT-Lang THRML discrete sweep
-2 warmup sweeps, 10 measured sweeps
-3.90 ms total, 0.390 ms/sweep, 2 dispatches/sweep
+j-quietbox-ttlang-generic-default-smoke-iuahj8
+0.410 ms/sweep, 2 dispatches/sweep
+
+j-quietbox-ttlang-generic-three-group-smoke-iudl1t
+1.027 ms/sweep, 3 dispatches/sweep
 ```
 
-The prior fixed-randomness in-place runtime measured 3.47 ms total,
-0.347 ms/sweep. The prior copy-based 2-dispatch runtime measured 3.51 ms
-total, 0.351 ms/sweep. The prior 6-dispatch runtime measured 6.99 ms total,
-0.699 ms/sweep on the same QuietBox benchmark shape.
+The earlier steady two-group benchmark measured 0.390 ms/sweep. The prior
+6-dispatch runtime measured 0.699 ms/sweep on the same QuietBox benchmark
+shape.
 
 ## Randomness
 
